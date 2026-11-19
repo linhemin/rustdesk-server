@@ -327,7 +327,7 @@ impl RendezvousServer {
                     // B registered
                     if !rp.id.is_empty() {
                         log::trace!("New peer registered: {:?} {:?}", &rp.id, &addr);
-                        self.update_addr(rp.id, addr, socket).await?;
+                        self.update_addr(rp.id, addr, rp.lan_probe, socket).await?;
                         if self.inner.serial > rp.serial {
                             let mut msg_out = RendezvousMessage::new();
                             msg_out.set_configure_update(ConfigUpdate {
@@ -565,6 +565,7 @@ impl RendezvousServer {
         &mut self,
         id: String,
         socket_addr: SocketAddr,
+        lan_probe: bool,
         socket: &mut FramedSocket,
     ) -> ResultType<()> {
         let (request_pk, ip_change) = if let Some(old) = self.pm.get_in_memory(&id).await {
@@ -579,6 +580,7 @@ impl RendezvousServer {
             if !request_pk {
                 old.socket_addr = socket_addr;
                 old.last_reg_time = Instant::now();
+                old.lan_probe = lan_probe;
             }
             let ip_change = if ip_change && old.reg_pk.0 <= 2 {
                 Some(if old.socket_addr.port() == 0 {
@@ -645,6 +647,13 @@ impl RendezvousServer {
         addr: SocketAddr,
         socket: Option<&'a mut FramedSocket>,
     ) -> ResultType<()> {
+        // The new LAN probe returns a port over TCP. LAN IPs come from local discovery.
+        if la.lan_probe {
+            let endpoint = AddrMangle::decode(&la.local_addr);
+            if socket.is_some() || !endpoint.ip().is_unspecified() || endpoint.port() == 0 {
+                return Ok(());
+            }
+        }
         // relay local addrs of B to A
         let addr_a = AddrMangle::decode(&la.socket_addr);
         log::debug!(
@@ -656,6 +665,7 @@ impl RendezvousServer {
         let mut msg_out = RendezvousMessage::new();
         let mut p = PunchHoleResponse {
             socket_addr: la.local_addr.clone(),
+            lan_probe: la.lan_probe,
             pk: self.get_pk(&la.version, la.id).await,
             relay_server: la.relay_server,
             ..Default::default()
@@ -695,9 +705,13 @@ impl RendezvousServer {
         // because punch hole won't work if in the same intranet,
         // all routers will drop such self-connections.
         if let Some(peer) = self.pm.get(&id).await {
-            let (elapsed, peer_addr) = {
+            let (elapsed, peer_addr, peer_lan_probe) = {
                 let r = peer.read().await;
-                (r.last_reg_time.elapsed().as_millis() as i64, r.socket_addr)
+                (
+                    r.last_reg_time.elapsed().as_millis() as i64,
+                    r.socket_addr,
+                    r.lan_probe,
+                )
             };
             if elapsed >= REG_TIMEOUT {
                 let mut msg_out = RendezvousMessage::new();
@@ -734,6 +748,24 @@ impl RendezvousServer {
                     relay_server = self.inner.local_ip.clone()
                 }
                 ph.nat_type = NatType::SYMMETRIC.into(); // will force relay
+            }
+            if ph.lan_probe {
+                if ws || !peer_lan_probe || ALWAYS_USE_RELAY.load(Ordering::SeqCst)
+                    || (peer_is_lan ^ is_lan)
+                {
+                    msg_out.set_punch_hole_response(PunchHoleResponse {
+                        other_failure: "LAN probe unavailable".to_owned(),
+                        ..Default::default()
+                    });
+                    return Ok((msg_out, None));
+                }
+                msg_out.set_fetch_local_addr(FetchLocalAddr {
+                    socket_addr: AddrMangle::encode(addr).into(),
+                    relay_server,
+                    lan_probe: true,
+                    ..Default::default()
+                });
+                return Ok((msg_out, Some(peer_addr)));
             }
             let same_intranet: bool = !ws
                 && (peer_is_lan && is_lan || {
