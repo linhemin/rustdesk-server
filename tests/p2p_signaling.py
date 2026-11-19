@@ -18,6 +18,9 @@ from nacl.bindings import (
     crypto_sign_open,
 )
 
+# A protobuf int32 below zero is encoded as a sign-extended, 64-bit varint.
+SESSION_DIRECT_PROOF = (1 << 64) - 604180
+
 
 def varint(value):
     data = bytearray()
@@ -257,6 +260,13 @@ def test(workspace):
             assert reply[6] == 1 and reply[1] == listener and len(reply[2]) > 64
         print("Confirmed stock controller receives the same-egress LAN address and signed key")
 
+        with socket.create_connection(endpoint, 4, controller) as connection:
+            # An ordinary, unsecured NAT test has neither an authenticated reply nor a reusable
+            # connection, including if its caller happens to supply the reserved serial.
+            send_tcp(connection, field(20, field(1, SESSION_DIRECT_PROOF)))
+            assert read_tcp(connection, 21)[1] == connection.getsockname()[1]
+            assert not connection.recv(1)
+
         public_key = base64.b64decode(key.read_bytes())
         offer, fingerprint = description("offer", b"12")
         answer, _ = description("answer", b"AB")
@@ -310,6 +320,8 @@ def test(workspace):
             relay_endpoint = (relay_address(), 32217)
             with socket.create_connection(endpoint, 4, controlled) as response:
                 windows = SecureConnection(response, public_key)
+                windows.send(20, field(1, SESSION_DIRECT_PROOF))
+                assert windows.read(21)[1] == response.getsockname()[1]
                 windows.send(19, field(1, punch[1]) + field(2, relay_id)
                              + field(3, b"127.0.0.1:32217") + field(4, peer_id)
                              + field(7, version) + field(12, answer))
@@ -340,8 +352,11 @@ def test_restricted_policy(server, workspace, env, port):
             with socket.create_connection(endpoint, 4) as connection:
                 session = SecureConnection(connection, base64.b64decode(key.read_bytes()))
                 assert session.allow_session_direct == 0
+                session.send(20, field(1, SESSION_DIRECT_PROOF))
+                assert session.read(21).get(1, 0) == 0
                 session.send(20, b"")
                 assert session.read(21)[1] == connection.getsockname()[1]
+                assert not connection.recv(1)
         finally:
             process.terminate()
             process.wait(timeout=8)

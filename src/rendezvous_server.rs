@@ -62,6 +62,7 @@ static ROTATION_RELAY_SERVER: AtomicUsize = AtomicUsize::new(0);
 type RelayServers = Vec<String>;
 const CHECK_RELAY_TIMEOUT: u64 = 3_000;
 static ALWAYS_USE_RELAY: AtomicBool = AtomicBool::new(false);
+const SESSION_DIRECT_PROOF_SERIAL: i32 = -604180;
 
 // Store punch hole requests
 use once_cell::sync::Lazy;
@@ -855,6 +856,17 @@ impl RendezvousServer {
         use rendezvous_message::Union;
 
         match RendezvousMessage::parse_from_bytes(bytes)?.union {
+            // This handler is reached only after the rendezvous key exchange. Keep the
+            // connection available for RelayResponse after proving possession of its
+            // directional key. Ordinary NAT requests retain their one-shot behavior.
+            Some(Union::TestNatRequest(request)) if request.serial == SESSION_DIRECT_PROOF_SERIAL => {
+                let mut reply = RendezvousMessage::new();
+                reply.set_test_nat_response(TestNatResponse {
+                    port: if self.allows_session_direct() { i32::from(addr.port()) } else { 0 },
+                    ..Default::default()
+                });
+                sender.try_send(reply)?;
+            }
             Some(Union::PunchHoleRequest(ph)) if !ph.webrtc_sdp_offer.is_empty() => {
                 let Some(session_key) = webrtc_signaling::description_key(&ph.webrtc_sdp_offer, "offer") else {
                     return Ok(false);
@@ -1372,12 +1384,8 @@ impl RendezvousServer {
         let mut conn = FramedStream::from(stream, addr);
         conn.set_send_timeout(2000);
         conn.set_max_packet_length(webrtc_signaling::FRAME_LIMIT);
-        // At handshake time the destination peer is unknown. With a LAN mask the per-peer
-        // routing decision must be made by the rendezvous request, not by this server-wide bit.
-        let allow_session_direct =
-            self.inner.mask.is_none() && !ALWAYS_USE_RELAY.load(Ordering::SeqCst);
         let mut first =
-            webrtc_signaling::begin_key_exchange(&mut conn, sk, allow_session_direct).await?;
+            webrtc_signaling::begin_key_exchange(&mut conn, sk, self.allows_session_direct()).await?;
         let (sender, mut outgoing) = mpsc::channel(96);
         let mut active_route = None;
         let mut sink = Some(Sink::Queued(sender.clone()));
@@ -1473,6 +1481,11 @@ impl RendezvousServer {
     }
 
     #[inline]
+    fn allows_session_direct(&self) -> bool {
+        // A server-wide grant cannot express which pairs may connect under a LAN mask.
+        self.inner.mask.is_none() && !ALWAYS_USE_RELAY.load(Ordering::SeqCst)
+    }
+
     fn is_lan(&self, addr: SocketAddr) -> bool {
         if let Some(network) = &self.inner.mask {
             match addr {
