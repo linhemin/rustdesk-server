@@ -183,7 +183,7 @@ def wait_for_server(workspace, endpoint):
         try:
             with socket.create_connection(endpoint, 0.2):
                 break
-        except ConnectionRefusedError:
+        except (ConnectionRefusedError, socket.timeout):
             assert time.monotonic() < deadline, "server did not listen"
             time.sleep(0.05)
     return key
