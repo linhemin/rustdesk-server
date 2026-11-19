@@ -155,6 +155,15 @@ def expect_no_packet(sock):
         sock.settimeout(original)
 
 
+def relay_address():
+    # hbbr reserves source loopback addresses for its administrative socket.
+    if address := os.environ.get("RUSTDESK_TEST_RELAY_HOST"):
+        return address
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as route:
+        route.connect(("192.0.2.1", 9))
+        return route.getsockname()[0]
+
+
 def encode_address(address, port):
     stamp = int(time.time() * 1_000_000) & 0xFFFFFFFF
     ip = int.from_bytes(socket.inet_aton(address), "little")
@@ -291,7 +300,7 @@ def test(workspace):
             punch = parse(parse(mediator.recv(2048))[9])
             relay_id = b"e0642844-85b1-4ca8-9bbb-af277182f5ee"
             relay_request = field(18, field(2, relay_id) + field(6, key.read_bytes().strip()))
-            relay_endpoint = ("127.0.0.1", 32217)
+            relay_endpoint = (relay_address(), 32217)
             with socket.create_connection(endpoint, 4, controlled) as response:
                 windows = SecureConnection(response, public_key)
                 windows.send(19, field(1, punch[1]) + field(2, relay_id)
@@ -300,9 +309,12 @@ def test(workspace):
                 reply = phone.read(19)
                 assert reply[2] == relay_id and reply[12] == answer
                 assert parse(crypto_sign_open(reply[5], public_key))[1] == peer_id
-            with socket.create_connection(relay_endpoint, 4, controller) as one, \
-                    socket.create_connection(relay_endpoint, 4, controlled) as two:
+            with socket.create_connection(relay_endpoint, 4) as one, \
+                    socket.create_connection(relay_endpoint, 4) as two:
                 send_tcp(one, relay_request)
+                # The controlled side has sent its request before the controller receives
+                # RelayResponse. Stagger the test sockets to reproduce that ordering.
+                time.sleep(0.15)
                 send_tcp(two, relay_request)
                 payload = b"relay transport smoke payload"
                 one.sendall(payload)
