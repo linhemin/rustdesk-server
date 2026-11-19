@@ -1372,7 +1372,12 @@ impl RendezvousServer {
         let mut conn = FramedStream::from(stream, addr);
         conn.set_send_timeout(2000);
         conn.set_max_packet_length(webrtc_signaling::FRAME_LIMIT);
-        let mut first = webrtc_signaling::begin_key_exchange(&mut conn, sk).await?;
+        // At handshake time the destination peer is unknown. With a LAN mask the per-peer
+        // routing decision must be made by the rendezvous request, not by this server-wide bit.
+        let allow_session_direct =
+            self.inner.mask.is_none() && !ALWAYS_USE_RELAY.load(Ordering::SeqCst);
+        let mut first =
+            webrtc_signaling::begin_key_exchange(&mut conn, sk, allow_session_direct).await?;
         let (sender, mut outgoing) = mpsc::channel(96);
         let mut active_route = None;
         let mut sink = Some(Sink::Queued(sender.clone()));

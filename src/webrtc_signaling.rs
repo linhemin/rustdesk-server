@@ -30,12 +30,14 @@ pub(crate) type Outbound = mpsc::Sender<RendezvousMessage>;
 pub(crate) async fn begin_key_exchange(
     conn: &mut FramedStream,
     sk: &sign::SecretKey,
+    allow_session_direct: bool,
 ) -> ResultType<Option<BytesMut>> {
     let (mut server_pk, server_sk) = box_::gen_keypair();
     server_pk.0[31] |= 0x80; // X25519 ignores this bit; RustDesk uses it to require signed params.
     let params = KxParams {
         pk: Bytes::copy_from_slice(&server_pk.0),
         version: KX_VERSION_LATEST,
+        allow_session_direct,
         ..Default::default()
     };
     let mut signed = KX_PARAMS_DOMAIN.to_vec();

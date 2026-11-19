@@ -109,7 +109,9 @@ class SecureConnection:
         assert len(server_key) == 32 and server_key[-1] & 0x80
         params = crypto_sign_open(exchange[3], public_key)
         assert params.startswith(b"rdkx-params")
-        assert parse(params[len(b"rdkx-params"):]) == {1: server_key, 2: 1}
+        signed_params = parse(params[len(b"rdkx-params"):])
+        assert signed_params[1] == server_key and signed_params[2] == 1
+        self.allow_session_direct = signed_params.get(3, 0)
         public, private = crypto_box_keypair()
         master = os.urandom(32)
         encrypted = crypto_box(master, bytes(24), server_key, private)
@@ -171,13 +173,7 @@ def encode_address(address, port):
     return encoded.to_bytes(16, "little").rstrip(b"\x00")
 
 
-def test(workspace):
-    port = 32216
-    endpoint = ("127.0.0.1", port)
-    controller = ("127.0.0.2", 0)
-    controlled = ("127.0.0.3", 0)
-    peer_id = b"324165901"
-    version = b"1.5.3"
+def wait_for_server(workspace, endpoint):
     key = workspace.joinpath("id_ed25519.pub")
     deadline = time.monotonic() + 8
     while not key.exists():
@@ -190,6 +186,16 @@ def test(workspace):
         except ConnectionRefusedError:
             assert time.monotonic() < deadline, "server did not listen"
             time.sleep(0.05)
+    return key
+
+
+def test(workspace):
+    endpoint = ("127.0.0.1", 32216)
+    controller = ("127.0.0.2", 0)
+    controlled = ("127.0.0.3", 0)
+    peer_id = b"324165901"
+    version = b"1.5.3"
+    key = wait_for_server(workspace, endpoint)
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as mediator:
         mediator.settimeout(4)
         mediator.bind(controlled)
@@ -267,6 +273,7 @@ def test(workspace):
 
         with socket.create_connection(endpoint, 4, controller) as connection:
             phone = SecureConnection(connection, public_key)
+            assert phone.allow_session_direct == 1
             phone.send(8, req)
             forwarded = parse(parse(mediator.recv(2048))[9])
             assert forwarded[10] == offer
@@ -323,13 +330,32 @@ def test(workspace):
         print("Confirmed relay answer carries the SDP and hbbr can pair/forward when ICE is unavailable")
 
 
+def test_restricted_policy(server, workspace, env, port):
+    endpoint = ("127.0.0.1", port)
+    with workspace.joinpath("policy.log").open("a") as log:
+        process = subprocess.Popen([server, "-p", str(port)], cwd=workspace, env=env,
+                                   stdout=log, stderr=log)
+        try:
+            key = wait_for_server(workspace, endpoint)
+            with socket.create_connection(endpoint, 4) as connection:
+                session = SecureConnection(connection, base64.b64decode(key.read_bytes()))
+                assert session.allow_session_direct == 0
+                session.send(20, b"")
+                assert session.read(21)[1] == connection.getsockname()[1]
+        finally:
+            process.terminate()
+            process.wait(timeout=8)
+
+
 def main():
     server = Path(sys.argv[1]).resolve()
     relay = Path(sys.argv[2]).resolve()
     with tempfile.TemporaryDirectory(prefix="rustdesk-p2p-smoke-") as temp:
         workspace = Path(temp)
         with workspace.joinpath("hbbs.log").open("w+") as log:
-            process = subprocess.Popen([server, "-p", "32216"], cwd=workspace, stdout=log, stderr=log)
+            env = dict(os.environ, ALWAYS_USE_RELAY="N", MASK="")
+            process = subprocess.Popen([server, "-p", "32216"], cwd=workspace, env=env,
+                                       stdout=log, stderr=log)
             relay_process = subprocess.Popen(
                 [relay, "-p", "32217"], cwd=workspace, stdout=log, stderr=log
             )
@@ -346,6 +372,9 @@ def main():
                 relay_process.terminate()
                 process.wait(timeout=8)
                 relay_process.wait(timeout=8)
+        test_restricted_policy(server, workspace, dict(env, ALWAYS_USE_RELAY="Y"), 32236)
+        test_restricted_policy(server, workspace, dict(env, MASK="192.168.0.0/16"), 32246)
+        print("Confirmed signed session-direct policy is disabled by forced relay or a LAN mask")
 
 
 if __name__ == "__main__":
