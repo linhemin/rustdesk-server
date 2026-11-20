@@ -2,7 +2,7 @@ name: P2P TUN server build
 
 on:
   push:
-    branches: [p2p-tun, p2p-cellular-server]
+    branches: [p2p-tun, p2p-cellular-server, authenticated-nat-observer]
   workflow_dispatch:
 
 permissions:

@@ -38,6 +38,11 @@ pub(crate) async fn begin_key_exchange(
         pk: Bytes::copy_from_slice(&server_pk.0),
         version: KX_VERSION_LATEST,
         allow_session_direct,
+        udp_mapping_observers: if allow_session_direct {
+            crate::mapping_observer::configured()
+        } else {
+            Vec::new()
+        },
         ..Default::default()
     };
     let mut signed = KX_PARAMS_DOMAIN.to_vec();

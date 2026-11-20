@@ -115,6 +115,9 @@ class SecureConnection:
         signed_params = parse(params[len(b"rdkx-params"):])
         assert signed_params[1] == server_key and signed_params[2] == 1
         self.allow_session_direct = signed_params.get(3, 0)
+        # This fixture uses a single documentation address; it is never contacted.
+        if os.environ.get("TEST_SIGNED_OBSERVER"):
+            assert signed_params.get(4) == (b"192.0.2.17:32216" if self.allow_session_direct else None)
         public, private = crypto_box_keypair()
         master = os.urandom(32)
         encrypted = crypto_box(master, bytes(24), server_key, private)
@@ -203,6 +206,16 @@ def test(workspace):
         mediator.settimeout(4)
         mediator.bind(controlled)
         mediator.connect(endpoint)
+        tid = os.urandom(12)
+        cookie = bytes.fromhex("2112a442")
+        software = b"RustDesk observation"
+        query = b"\x00\x01\x00\x18" + cookie + tid + b"\x80\x22\x00\x14" + software
+        mediator.send(query)
+        response = mediator.recv(256)
+        assert response[:8] == b"\x01\x01\x00\x0c" + cookie and response[8:20] == tid
+        assert response[20:26] == b"\x00\x20\x00\x08\x00\x01"
+        assert int.from_bytes(response[26:28], "big") ^ 0x2112 == mediator.getsockname()[1]
+        assert bytes(a ^ b for a,b in zip(response[28:32],cookie)) == socket.inet_aton(controlled[0])
         mediator.send(field(15, field(1, peer_id) + field(2, b"test-lan-client") + field(3, bytes(range(32)))))
         assert parse(parse(mediator.recv(2048))[16]).get(1, 0) == 0
 
@@ -368,7 +381,8 @@ def main():
     with tempfile.TemporaryDirectory(prefix="rustdesk-p2p-smoke-") as temp:
         workspace = Path(temp)
         with workspace.joinpath("hbbs.log").open("w+") as log:
-            env = dict(os.environ, ALWAYS_USE_RELAY="N", MASK="")
+            os.environ["TEST_SIGNED_OBSERVER"] = "1"
+            env = dict(os.environ, ALWAYS_USE_RELAY="N", MASK="", RUSTDESK_UDP_MAPPING_OBSERVERS="192.0.2.17:32216")
             process = subprocess.Popen([server, "-p", "32216"], cwd=workspace, env=env,
                                        stdout=log, stderr=log)
             relay_process = subprocess.Popen(

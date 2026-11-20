@@ -326,6 +326,15 @@ impl RendezvousServer {
         socket: &mut FramedSocket,
         key: &str,
     ) -> ResultType<()> {
+        if crate::mapping_observer::is_stun(bytes) {
+            if let (FramedSocket::Direct(listener), Some(reply)) =
+                (socket, crate::mapping_observer::binding_reply(bytes, addr))
+            {
+                // A transient ICMP error on a measurement must not restart hbbs's UDP socket.
+                let _ = listener.get_ref().send_to(&reply, addr).await;
+            }
+            return Ok(());
+        }
         if let Ok(msg_in) = RendezvousMessage::parse_from_bytes(bytes) {
             match msg_in.union {
                 Some(rendezvous_message::Union::RegisterPeer(rp)) => {
