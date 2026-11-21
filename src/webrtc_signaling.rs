@@ -31,6 +31,7 @@ pub(crate) async fn begin_key_exchange(
     conn: &mut FramedStream,
     sk: &sign::SecretKey,
     allow_session_direct: bool,
+    allow_p2p_feedback: bool,
 ) -> ResultType<Option<BytesMut>> {
     let (mut server_pk, server_sk) = box_::gen_keypair();
     server_pk.0[31] |= 0x80; // X25519 ignores this bit; RustDesk uses it to require signed params.
@@ -38,6 +39,7 @@ pub(crate) async fn begin_key_exchange(
         pk: Bytes::copy_from_slice(&server_pk.0),
         version: KX_VERSION_LATEST,
         allow_session_direct,
+        allow_p2p_feedback,
         udp_mapping_observers: if allow_session_direct {
             crate::mapping_observer::configured()
         } else {

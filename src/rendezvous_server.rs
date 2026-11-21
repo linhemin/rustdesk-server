@@ -80,6 +80,7 @@ struct Inner {
     mask: Option<Ipv4Network>,
     local_ip: String,
     sk: Option<sign::SecretKey>,
+    punch_metrics: Arc<crate::punch_metrics::Metrics>,
 }
 
 #[derive(Clone)]
@@ -146,6 +147,9 @@ impl RendezvousServer {
                 sk,
                 mask,
                 local_ip,
+                punch_metrics: Arc::new(crate::punch_metrics::Metrics::new(
+                    std::env::var("P2P_FEEDBACK").is_ok_and(|value| value == "Y")
+                )),
             }),
         };
         log::info!("mask: {:?}", rs.inner.mask);
@@ -327,11 +331,14 @@ impl RendezvousServer {
         key: &str,
     ) -> ResultType<()> {
         if crate::mapping_observer::is_stun(bytes) {
+            let reply = crate::mapping_observer::binding_reply(bytes, addr);
+            self.inner.punch_metrics.observer(addr, reply.is_some());
             if let (FramedSocket::Direct(listener), Some(reply)) =
-                (socket, crate::mapping_observer::binding_reply(bytes, addr))
+                (socket, reply)
             {
                 // A transient ICMP error on a measurement must not restart hbbs's UDP socket.
-                let _ = listener.get_ref().send_to(&reply, addr).await;
+                let sent = listener.get_ref().send_to(&reply, addr).await.is_ok();
+                self.inner.punch_metrics.observer_reply(sent);
             }
             return Ok(());
         }
@@ -875,6 +882,10 @@ impl RendezvousServer {
         use rendezvous_message::Union;
 
         match RendezvousMessage::parse_from_bytes(bytes)?.union {
+            Some(Union::P2pFeedback(report)) => {
+                self.inner.punch_metrics.report(report);
+                return Ok(false);
+            }
             // This handler is reached only after the rendezvous key exchange. Keep the
             // connection available for RelayResponse after proving possession of its
             // directional key. Ordinary NAT requests retain their one-shot behavior.
@@ -1331,6 +1342,9 @@ impl RendezvousServer {
                     );
                 }
             }
+            Some("p2p-metrics") => {
+                res = self.inner.punch_metrics.snapshot();
+            }
             Some("test-geo" | "tg") => {
                 if let Some(rs) = fds.next() {
                     if let Ok(a) = rs.parse::<IpAddr>() {
@@ -1471,8 +1485,13 @@ impl RendezvousServer {
         let mut conn = FramedStream::from(stream, addr);
         conn.set_send_timeout(2000);
         conn.set_max_packet_length(webrtc_signaling::FRAME_LIMIT);
-        let mut first =
-            webrtc_signaling::begin_key_exchange(&mut conn, sk, self.allows_session_direct()).await?;
+        let mut first = webrtc_signaling::begin_key_exchange(
+            &mut conn,
+            sk,
+            self.allows_session_direct(),
+            self.inner.punch_metrics.enabled(),
+        )
+        .await?;
         let (sender, mut outgoing) = mpsc::channel(96);
         let mut active_route = None;
         let mut sink = Some(Sink::Queued(sender.clone()));

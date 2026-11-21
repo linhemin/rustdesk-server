@@ -115,6 +115,7 @@ class SecureConnection:
         signed_params = parse(params[len(b"rdkx-params"):])
         assert signed_params[1] == server_key and signed_params[2] == 1
         self.allow_session_direct = signed_params.get(3, 0)
+        self.allow_p2p_feedback = signed_params.get(5, 0)
         # This fixture uses a single documentation address; it is never contacted.
         if os.environ.get("TEST_SIGNED_OBSERVER"):
             assert signed_params.get(4) == (b"192.0.2.17:32216" if self.allow_session_direct else None)
