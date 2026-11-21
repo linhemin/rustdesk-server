@@ -323,6 +323,37 @@ def test(workspace):
 
         print("Confirmed signed v1 key exchange and scoped SDP/ICE delivery in both directions")
 
+        mediator.send(field(6, field(1, peer_id) + field(4, 1)))
+        assert not parse(parse(mediator.recv(2048))[7]).get(2)
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as controller_udp, \
+                socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as peer_udp, \
+                socket.create_connection(endpoint, 4, controller) as connection:
+            controller_udp.bind(controller)
+            controller_udp.settimeout(4)
+            controller_udp.sendto(query, endpoint)
+            mapped = controller_udp.recv(256)
+            assert mapped[8:20] == tid
+            port = int.from_bytes(mapped[26:28], "big") ^ 0x2112
+            assert port == controller_udp.getsockname()[1]
+            phone = SecureConnection(connection, public_key)
+            phone.send(8, field(1, peer_id) + field(3, key.read_bytes().strip()) + field(7, port))
+            punch = parse(parse(mediator.recv(2048))[9])
+            assert punch[4] == port and len(punch[31]) == 16 and 10 not in punch
+            peer_udp.bind(controlled)
+            response = field(1, punch[1]) + field(2, peer_id) + field(5, version)
+            peer_udp.sendto(field(10, response + field(31, b"wrong reply key!")), endpoint)
+            expect_no_packet(connection)
+            datagram = field(10, response + field(31, punch[31]))
+            peer_udp.sendto(datagram, endpoint)
+            reply = phone.read(11)
+            encoded = int.from_bytes(reply[1], "little")
+            stamp = (encoded >> 17) & 0xffffffff
+            assert (((encoded & 0xffffff) - (stamp & 0xffff)) & 0xffff) == peer_udp.getsockname()[1]
+            assert reply[9] == 1 and parse(crypto_sign_open(reply[2], public_key))[1] == peer_id
+            peer_udp.sendto(datagram, endpoint)
+            expect_no_packet(connection)
+        print("Confirmed same-socket UDP observation and one-use authenticated KCP rendezvous")
+
         # Exercise the Windows symmetric-NAT branch, where the answer rides beside the relay UUID.
         with socket.create_connection(endpoint, 4, controller) as connection:
             phone = SecureConnection(connection, public_key)

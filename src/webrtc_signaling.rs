@@ -117,6 +117,7 @@ pub(crate) struct Route {
     pub peer_id: String,
     pub session_key: String,
     pub sender: Outbound,
+    pub udp_reply_token: Option<[u8; 16]>,
     expires: Instant,
     offer_retries: usize,
     controller_candidates: usize,
@@ -155,6 +156,7 @@ impl Routes {
                 peer_id,
                 session_key,
                 sender,
+                udp_reply_token: None,
                 expires: now + ROUTE_LIFETIME,
                 offer_retries: 0,
                 controller_candidates: 0,
@@ -188,7 +190,8 @@ impl Route {
     }
 
     pub(crate) fn allows_candidate(&mut self, candidate: &IceCandidate, from_peer: bool) -> bool {
-        if candidate.session_key != self.session_key
+        if self.session_key.is_empty()
+            || candidate.session_key != self.session_key
             || candidate.candidate.is_empty()
             || candidate.candidate.len() > CANDIDATE_LIMIT
         {
