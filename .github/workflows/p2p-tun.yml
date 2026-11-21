@@ -1,0 +1,36 @@
+name: P2P TUN server build
+
+on:
+  push:
+    branches: [p2p-tun, p2p-cellular-server, authenticated-nat-observer]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          submodules: recursive
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9
+        with:
+          toolchain: '1.90'
+      - name: Build server binaries
+        run: cargo build --locked --release --bins
+      - name: Verify encrypted signaling, LAN and relay compatibility
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y python3-nacl
+          /usr/bin/python3 tests/p2p_signaling.py target/release/hbbs target/release/hbbr
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: rustdesk-p2p-tun-linux-x64
+          path: |
+            target/release/hbbs
+            target/release/hbbr
+            target/release/rustdesk-utils
+          if-no-files-found: error

@@ -34,6 +34,8 @@ pub(crate) struct PeerInfo {
 
 pub(crate) struct Peer {
     pub(crate) socket_addr: SocketAddr,
+    pub(crate) lan_probe: bool,
+    pub(crate) udp_punch_reply: bool,
     pub(crate) last_reg_time: Instant,
     pub(crate) guid: Vec<u8>,
     pub(crate) uuid: Bytes,
@@ -48,6 +50,8 @@ impl Default for Peer {
     fn default() -> Self {
         Self {
             socket_addr: "0.0.0.0:0".parse().unwrap(),
+            lan_probe: false,
+            udp_punch_reply: false,
             last_reg_time: get_expired_time(),
             guid: Vec::new(),
             uuid: Bytes::new(),
