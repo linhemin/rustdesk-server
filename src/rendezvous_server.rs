@@ -80,6 +80,7 @@ struct Inner {
     mask: Option<Ipv4Network>,
     local_ip: String,
     sk: Option<sign::SecretKey>,
+    relay_policy: crate::relay_policy::Policy,
     punch_metrics: Arc<crate::punch_metrics::Metrics>,
 }
 
@@ -147,6 +148,7 @@ impl RendezvousServer {
                 sk,
                 mask,
                 local_ip,
+                relay_policy: crate::relay_policy::Policy::parse(&std::env::var("RELAY_ISP_ROUTES").unwrap_or_default())?,
                 punch_metrics: Arc::new(crate::punch_metrics::Metrics::new(
                     std::env::var("P2P_FEEDBACK").is_ok_and(|value| value == "Y")
                 )),
@@ -1185,11 +1187,14 @@ impl RendezvousServer {
         self.relay_servers = self.relay_servers0.clone();
     }
 
-    fn get_relay_server(&self, _pa: IpAddr, _pb: IpAddr) -> String {
+    fn get_relay_server(&self, pa: IpAddr, pb: IpAddr) -> String {
         if self.relay_servers.is_empty() {
             return "".to_owned();
         } else if self.relay_servers.len() == 1 {
             return self.relay_servers[0].clone();
+        }
+        if let Some(relay) = self.inner.relay_policy.select(pa, pb, &self.relay_servers) {
+            return relay.to_owned();
         }
         let i = ROTATION_RELAY_SERVER.fetch_add(1, Ordering::SeqCst) % self.relay_servers.len();
         self.relay_servers[i].clone()

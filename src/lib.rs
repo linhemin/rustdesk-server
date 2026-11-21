@@ -5,5 +5,6 @@ pub mod common;
 mod database;
 mod peer;
 mod punch_metrics;
+mod relay_policy;
 mod version;
 mod webrtc_signaling;
