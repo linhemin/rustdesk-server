@@ -1092,6 +1092,9 @@ impl RendezvousServer {
                     return Ok(false);
                 };
                 let peer_id = ph.id.clone();
+                let candidate_ports = if session_key.is_empty() && self.allows_session_direct() {
+                    crate::mapping_observer::verified_ports(&ph.udp_mapping_tickets, addr)
+                } else { Vec::new() };
                 let (mut msg, peer) = self.handle_punch_hole_request(addr, ph, key, false).await?;
                 let Some(peer) = peer else {
                     let _ = sender.try_send(msg);
@@ -1103,6 +1106,7 @@ impl RendezvousServer {
                     return Ok(false);
                 }
                 if session_key.is_empty() && self.allows_session_direct() {
+                    msg.mut_punch_hole().udp_candidate_ports = candidate_ports;
                     if let Some(SocketAddr::V4(wan)) = self.inner.shared_egress.and_then(|nat| nat.candidate(addr, peer)) {
                         msg.mut_punch_hole().shared_egress_ipv4 = Bytes::copy_from_slice(&wan.ip().octets());
                     }
@@ -1268,6 +1272,11 @@ impl RendezvousServer {
             socket_addr_v6: if direct_only { answer.socket_addr_v6.clone() } else { Bytes::new() },
             webrtc_sdp_answer: sdp,
             is_udp: true,
+            udp_candidate_ports: crate::mapping_observer::verified_ports(&answer.udp_mapping_tickets, from),
+            udp_probe_key: if matches!(answer.udp_mapping_tickets.len(), 38 | 76 | 114) && answer.webrtc_sdp_answer.is_empty()
+                && self.allows_session_direct() {
+                Bytes::copy_from_slice(&sodiumoxide::crypto::hash::sha256::hash(&answer.udp_reply_token).0)
+            } else { Bytes::new() },
             ..Default::default()
         };
         if let Ok(nat) = answer.nat_type.enum_value() {

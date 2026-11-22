@@ -4,6 +4,42 @@ use std::net::{IpAddr, SocketAddr};
 
 const COOKIE: [u8; 4] = [0x21, 0x12, 0xa4, 0x42];
 
+// Bind supplementary candidates to endpoints recently observed by this hbbs.
+fn receipt_tag(ip: IpAddr, prefix: &[u8]) -> sodiumoxide::crypto::auth::Tag {
+    use sodiumoxide::crypto::auth;
+    use std::sync::OnceLock;
+    static KEY: OnceLock<auth::Key> = OnceLock::new();
+    let mut message = match ip {
+        IpAddr::V4(ip) => ip.octets().to_vec(),
+        IpAddr::V6(ip) => ip.octets().to_vec(),
+    };
+    message.extend_from_slice(prefix);
+    auth::authenticate(&message, KEY.get_or_init(auth::gen_key))
+}
+
+fn minute() -> u32 {
+    (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default().as_secs() / 60) as u32
+}
+
+pub(crate) fn verified_ports(tickets: &[u8], from: SocketAddr) -> Vec<u32> {
+    if tickets.is_empty() || tickets.len() > 3 * 38 || tickets.len() % 38 != 0 {
+        return Vec::new();
+    }
+    let ip = hbb_common::try_into_v4(from).ip();
+    let now = minute();
+    let mut ports = Vec::new();
+    for ticket in tickets.chunks_exact(38) {
+        let port = u32::from(u16::from_be_bytes([ticket[0], ticket[1]]));
+        let issued = u32::from_be_bytes([ticket[2], ticket[3], ticket[4], ticket[5]]);
+        if now.wrapping_sub(issued) <= 1 && port > 0 && !ports.contains(&port)
+            && sodiumoxide::utils::memcmp(&receipt_tag(ip, &ticket[..6]).0, &ticket[6..]) {
+            ports.push(port);
+        }
+    }
+    ports
+}
+
 pub(crate) fn configured() -> Vec<String> {
     let mut observers = Vec::new();
     let list = std::env::var("RUSTDESK_UDP_MAPPING_OBSERVERS").unwrap_or_default();
@@ -122,6 +158,16 @@ pub(crate) fn binding_reply(data: &[u8], peer: SocketAddr) -> Option<Vec<u8>> {
     reply.extend_from_slice(&[0, 0x20, 0, (4 + ip.len()) as u8, 0, family]);
     reply.extend_from_slice(&(peer.port() ^ 0x2112).to_be_bytes());
     reply.extend(ip.iter().zip(&data[4..20]).map(|(a, b)| *a ^ *b));
+    if data.len() == 96 && data[20..24] == [0, 0x26, 0, 72] && &data[24..32] == b"RD-PATH1" {
+        let mut ticket = peer.port().to_be_bytes().to_vec();
+        ticket.extend_from_slice(&minute().to_be_bytes());
+        let tag = receipt_tag(address, &ticket);
+        reply.extend_from_slice(&[0xc0, 0x51, 0, 38]);
+        reply.extend_from_slice(&ticket);
+        reply.extend_from_slice(&tag.0);
+        reply.extend_from_slice(&[0, 0]);
+        reply[3] = (reply.len() - 20) as u8;
+    }
     Some(reply)
 }
 
@@ -184,6 +230,22 @@ mod tests {
                 .unwrap()
                 .octets()
         );
+    }
+
+    #[test]
+    fn supplementary_candidate_requires_receipt_from_the_same_source() {
+        let mut req = vec![0; 96];
+        req[..8].copy_from_slice(&[0, 1, 0, 76, 0x21, 0x12, 0xa4, 0x42]);
+        req[20..24].copy_from_slice(&[0, 0x26, 0, 72]);
+        req[24..32].copy_from_slice(b"RD-PATH1");
+        let source = "192.0.2.10:48721".parse().unwrap();
+        let reply = binding_reply(&req, source).unwrap();
+        assert!(reply.len() <= req.len());
+        let mut ticket = reply[36..74].to_vec();
+        assert_eq!(verified_ports(&ticket, source), [48721]);
+        assert!(verified_ports(&ticket, "192.0.2.11:48721".parse().unwrap()).is_empty());
+        ticket[1] ^= 1;
+        assert!(verified_ports(&ticket, source).is_empty());
     }
 
     #[test]
