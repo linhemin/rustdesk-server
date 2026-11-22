@@ -973,13 +973,7 @@ impl RendezvousServer {
                 return Ok((msg_out, Some(peer_addr)));
             }
             let same_intranet: bool = !ws && !force_relay && ph.webrtc_sdp_offer.is_empty()
-                && (peer_is_lan && is_lan || {
-                    match (peer_addr, addr) {
-                        (SocketAddr::V4(a), SocketAddr::V4(b)) => a.ip() == b.ip(),
-                        (SocketAddr::V6(a), SocketAddr::V6(b)) => a.ip() == b.ip(),
-                        _ => false,
-                    }
-                });
+                && (peer_is_lan && is_lan || try_into_v4(peer_addr).ip() == try_into_v4(addr).ip());
             let socket_addr = AddrMangle::encode(addr).into();
             if same_intranet {
                 log::debug!(

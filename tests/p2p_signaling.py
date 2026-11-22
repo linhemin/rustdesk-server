@@ -282,6 +282,19 @@ def test(workspace):
             assert not connection.recv(1)
 
         public_key = base64.b64decode(key.read_bytes())
+        with socket.create_connection(endpoint, 4, controlled) as requester:
+            session = SecureConnection(requester, public_key)
+            session.send(8, field(1, peer_id) + field(3, key.read_bytes().strip())
+                         + field(6, version) + field(7, 32192) + field(40, 1))
+            fetch = parse(parse(mediator.recv(2048))[12])
+            assert fetch[40] == 1
+            acknowledgement = field(1, fetch[1]) + field(2, listener) + field(4, peer_id) + field(5, version)
+            with socket.create_connection(endpoint, 4, controlled) as response:
+                send_tcp(response, field(13, acknowledgement))
+            reply = session.read(11)
+            assert reply[6] == 1 and reply[1] == listener and not reply.get(4)
+            assert parse(crypto_sign_open(reply[2], public_key))[1] == peer_id
+        print("Confirmed authenticated direct-only controller receives the same-egress LAN address")
         offer, fingerprint = description("offer", b"12")
         answer, _ = description("answer", b"AB")
         req = field(1, peer_id) + field(3, key.read_bytes().strip()) + field(12, offer)
