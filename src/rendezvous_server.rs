@@ -182,6 +182,7 @@ struct Inner {
     version: String,
     software_url: String,
     mask: Option<Ipv4Network>,
+    shared_egress: Option<crate::mapping_observer::SharedEgress>,
     local_ip: String,
     sk: Option<sign::SecretKey>,
     relay_policy: crate::relay_policy::Policy,
@@ -259,6 +260,7 @@ impl RendezvousServer {
                 software_url,
                 sk,
                 mask,
+                shared_egress: crate::mapping_observer::SharedEgress::configured(),
                 local_ip,
                 relay_policy: crate::relay_policy::Policy::parse(&std::env::var("RELAY_ISP_ROUTES").unwrap_or_default())?,
                 punch_metrics: Arc::new(crate::punch_metrics::Metrics::new(
@@ -1106,6 +1108,11 @@ impl RendezvousServer {
                 {
                     return Ok(false);
                 }
+                if session_key.is_empty() && self.allows_session_direct() {
+                    if let Some(SocketAddr::V4(wan)) = self.inner.shared_egress.and_then(|nat| nat.candidate(addr, peer)) {
+                        msg.mut_punch_hole().shared_egress_ipv4 = Bytes::copy_from_slice(&wan.ip().octets());
+                    }
+                }
                 let mut routes = self.webrtc_routes.lock().await;
                 if let Some(token) = active_route {
                     let Some(route) = routes.get(token) else {
@@ -1233,7 +1240,7 @@ impl RendezvousServer {
 
     async fn forward_udp_punch_answer(&mut self, answer: &PunchHoleSent, from: SocketAddr) -> ResultType<bool> {
         let from = try_into_v4(from);
-        let (sender, sdp, direct_only) = {
+        let (sender, sdp, direct_only, endpoint) = {
             let mut routes = self.webrtc_routes.lock().await;
             let Some(route) = routes.get(&answer.socket_addr) else {
                 return Ok(!answer.udp_reply_token.is_empty());
@@ -1252,10 +1259,16 @@ impl RendezvousServer {
             } else {
                 String::new()
             };
-            (route.sender.clone(), sdp, route.direct_only)
+            let mut endpoint = from;
+            if route.session_key.is_empty() && self.allows_session_direct() {
+                if let Some(wan) = self.inner.shared_egress.and_then(|nat| nat.candidate(from, route.controller)) {
+                    endpoint = wan;
+                }
+            }
+            (route.sender.clone(), sdp, route.direct_only, endpoint)
         };
         let mut response = PunchHoleResponse {
-            socket_addr: AddrMangle::encode(from).into(),
+            socket_addr: AddrMangle::encode(endpoint).into(),
             pk: self.get_pk(&answer.version, answer.id.clone()).await,
             relay_server: answer.relay_server.clone(),
             socket_addr_v6: if direct_only { answer.socket_addr_v6.clone() } else { Bytes::new() },

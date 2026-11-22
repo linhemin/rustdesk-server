@@ -33,6 +33,47 @@ pub(crate) fn configured() -> Vec<String> {
     observers
 }
 
+/// A NAT shared with hbbs can preserve the port while exposing only the
+/// inside address to hbbs. Advertise the operator's WAN address to WAN peers.
+#[derive(Clone, Copy)]
+pub(crate) struct SharedEgress {
+    inside: ipnetwork::Ipv4Network,
+    outside: std::net::Ipv4Addr,
+}
+
+impl SharedEgress {
+    pub(crate) fn configured() -> Option<Self> {
+        let value = std::env::var("RUSTDESK_UDP_SHARED_EGRESS").ok()?;
+        let parsed = Self::parse(&value);
+        if parsed.is_none() {
+            hbb_common::log::warn!("Ignoring invalid RUSTDESK_UDP_SHARED_EGRESS (expected private CIDR=public IPv4)");
+        }
+        parsed
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        let (inside, outside) = value.trim().split_once('=')?;
+        let inside: ipnetwork::Ipv4Network = inside.parse().ok()?;
+        let outside = outside.parse().ok()?;
+        (inside.network().is_private() && inside.broadcast().is_private() && Self::public(outside))
+            .then_some(Self { inside, outside })
+    }
+
+    fn public(ip: std::net::Ipv4Addr) -> bool {
+        let [a, b, _, _] = ip.octets();
+        a != 0 && a < 224 && !ip.is_private() && !ip.is_loopback() && !ip.is_link_local()
+            && !ip.is_documentation() && !(a == 100 && (64..128).contains(&b))
+            && !(a == 198 && (18..=19).contains(&b))
+    }
+
+    pub(crate) fn candidate(self, inside: SocketAddr, peer: SocketAddr) -> Option<SocketAddr> {
+        let (SocketAddr::V4(src), SocketAddr::V4(dst)) =
+            (hbb_common::try_into_v4(inside), hbb_common::try_into_v4(peer)) else { return None };
+        (self.inside.contains(*src.ip()) && Self::public(*dst.ip()) && *dst.ip() != self.outside)
+            .then(|| SocketAddr::from((self.outside, src.port())))
+    }
+}
+
 pub(crate) fn is_stun(data: &[u8]) -> bool {
     data.len() >= 20 && data[0] & 0xc0 == 0 && data[4..8] == COOKIE
 }
@@ -87,6 +128,18 @@ pub(crate) fn binding_reply(data: &[u8], peer: SocketAddr) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_egress_only_rewrites_the_configured_lan_for_a_wan_peer() {
+        let policy = SharedEgress::parse("192.168.4.0/24=8.8.8.8").unwrap();
+        let lan = "192.168.4.7:41003".parse().unwrap();
+        let wan = "1.1.1.1:39436".parse().unwrap();
+        assert_eq!(policy.candidate(lan, wan), Some("8.8.8.8:41003".parse().unwrap()));
+        assert!(policy.candidate(wan, lan).is_none());
+        assert!(policy.candidate(lan, lan).is_none());
+        assert!(policy.candidate("192.168.5.4:41003".parse().unwrap(), wan).is_none());
+        assert!(SharedEgress::parse("0.0.0.0/0=8.8.8.8").is_none());
+    }
 
     fn request() -> Vec<u8> {
         let mut b = vec![0, 1, 0, 24];
