@@ -145,11 +145,11 @@ class SecureConnection:
         return parse(parse(payload)[number])
 
 
-def description(kind, byte):
+def description(kind, byte, policy="all", candidate=b""):
     fingerprint = b"sha-256 " + b":".join([byte] * 32)
     sdp = b"v=0\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\na=fingerprint:" + fingerprint + b"\r\n"
     return b"webrtc://" + base64.b64encode(json.dumps(
-        {"type": kind, "sdp": sdp.decode(), "ice_policy": "all"}
+        {"type": kind, "sdp": (sdp + candidate).decode(), "ice_policy": policy}
     ).encode()), fingerprint
 
 

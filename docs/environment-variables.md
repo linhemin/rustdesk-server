@@ -46,12 +46,20 @@ in the inherited process environment.
 | *(config file)* | `-c`, `--config` | *(none)* | Path to an extra INI config file (see precedence above). |
 | `TEST_HBBS` 🅴 | *(none)* | *(auto)* | UDP self‑test target checked at start‑up. Set to `no` to skip the check (useful behind some NATs/proxies), or to an explicit `host:port`. |
 | `ALWAYS_USE_RELAY` 🅴 | *(none)* | `N` | `Y` forces every session through a relay (disables direct/hole‑punched connections). At runtime, send `always-use-relay Y` or `always-use-relay N` to the `hbbs` [loopback console](#runtime-console). |
+| `DIRECT_ONLY` | *(none)* | `N` | Set `Y` on both hbbs and hbbr and restart them. hbbs requires an explicit direct-only declaration during pairing. |
 | `DB_URL` 🅴 | *(none)* | `./db_v2.sqlite3` | Path/URL of the SQLite database file. See [Database](#database). |
 | `MAX_DATABASE_CONNECTIONS` 🅴 | *(none)* | `1` | Size of the SQLite connection pool. |
 | `MAX_PUNCH_REQUESTS` 🅴 | *(none)* | `100000` | Number of punch-request records kept in memory for the `punch-requests` [console](#runtime-console) command; the oldest is dropped when full. `0` disables recording. |
 | `MAX_MESSAGE_KB` 🅴 | *(none)* | `64` | Largest message, in KiB, that `hbbs` accepts on its TCP and WebSocket listeners; a connection that sends a bigger one is dropped. Capped at `65536`. The default fits an online-status query for about 5000 standard 9–10 digit IDs, fewer with long custom IDs; a client whose query is too big shows no online status. |
 
 🅴 = set through the inherited process environment.
+
+Direct-only pairing supports LAN discovery, TCP and UDP hole punching, and
+WebRTC signaling. If all direct paths fail, the connection fails. Older
+controllers receive `Direct connection required by server`. A controller can
+also request a direct-only session on a default server. Forced-relay and
+cross-mask restrictions still apply, so a pair that requires a relay cannot
+connect in direct-only mode.
 
 > `PORT_FOR_API` / `KEY_FOR_API` are only used by RustDesk Server **Pro** and its
 > API; they have no effect in the open‑source server.
@@ -75,6 +83,7 @@ for help).
 | Variable | Default | Unit | Description |
 |---|---|---|---|
 | `SINGLE_BANDWIDTH` | `128` | Mb/s | Normal maximum bandwidth for each relay connection. |
+| `DIRECT_ONLY` | `N` | `Y` / `N` | `Y` disables TCP and WebSocket relay pairing. Set it on hbbs as well to require direct-only sessions during rendezvous. |
 | `TOTAL_BANDWIDTH` | `1024` | Mb/s | Aggregate bandwidth cap shared by all relay connections. |
 | `LIMIT_SPEED` | `32` | Mb/s | Per-connection cap applied after a connection is downgraded, and to IPs in `blacklist.txt`. |
 | `DOWNGRADE_THRESHOLD` | `0.66` | ratio (0–1) | Fraction of `SINGLE_BANDWIDTH` that a connection's lifetime-average throughput must exceed to trigger downgrade. |

@@ -82,7 +82,14 @@ pub(crate) async fn begin_key_exchange(
     Ok(None)
 }
 
-pub(crate) fn description_key(endpoint: &str, kind: &str) -> Option<String> {
+fn direct_candidate(raw: &str) -> bool {
+    let mut fields = raw.split_ascii_whitespace();
+    !raw.contains(['\r', '\n'])
+        && fields.nth(6) == Some("typ")
+        && matches!(fields.next(), Some("host" | "srflx" | "prflx"))
+}
+
+pub(crate) fn description_key(endpoint: &str, kind: &str, direct_only: bool) -> Option<String> {
     if endpoint.len() > SDP_LIMIT {
         return None;
     }
@@ -91,10 +98,13 @@ pub(crate) fn description_key(endpoint: &str, kind: &str) -> Option<String> {
     if description.get("type")?.as_str()? != kind {
         return None;
     }
-    let fingerprint = description
-        .get("sdp")?
-        .as_str()?
-        .lines()
+    let sdp = description.get("sdp")?.as_str()?;
+    if direct_only && (description.get("ice_policy")?.as_str()? != "direct_only"
+        || sdp.lines().filter_map(|line| line.trim().strip_prefix("a=candidate:"))
+            .any(|candidate| !direct_candidate(candidate))) {
+        return None;
+    }
+    let fingerprint = sdp.lines()
         .find_map(|line| line.strip_prefix("a=fingerprint:"))?;
     let digest = fingerprint.strip_prefix("sha-256 ")?;
     if digest.len() == 95
@@ -119,6 +129,7 @@ pub(crate) struct Route {
     pub peer_id: String,
     pub session_key: String,
     pub sender: Outbound,
+    pub direct_only: bool,
     pub udp_reply_token: Option<[u8; 16]>,
     expires: Instant,
     offer_retries: usize,
@@ -158,6 +169,7 @@ impl Routes {
                 peer_id,
                 session_key,
                 sender,
+                direct_only: false,
                 udp_reply_token: None,
                 expires: now + ROUTE_LIFETIME,
                 offer_retries: 0,
@@ -196,6 +208,13 @@ impl Route {
             || candidate.session_key != self.session_key
             || candidate.candidate.is_empty()
             || candidate.candidate.len() > CANDIDATE_LIMIT
+        {
+            return false;
+        }
+        if self.direct_only && !serde_json::from_str::<serde_json::Value>(&candidate.candidate)
+            .ok().and_then(|ice| ice.get("candidate")?.as_str()
+                .map(|raw| raw.is_empty() || direct_candidate(raw)))
+            .unwrap_or(false)
         {
             return false;
         }

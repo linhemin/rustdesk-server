@@ -180,6 +180,13 @@ pub fn get_arg(name: &str) -> String {
     get_arg_or(name, "".to_owned())
 }
 
+pub fn direct_only_enabled() -> bool {
+    static ENABLED: once_cell::sync::Lazy<bool> = once_cell::sync::Lazy::new(|| {
+        get_arg("DIRECT_ONLY").trim().eq_ignore_ascii_case("Y")
+    });
+    *ENABLED
+}
+
 #[allow(dead_code)]
 #[inline]
 pub fn get_arg_or(name: &str, default: String) -> String {

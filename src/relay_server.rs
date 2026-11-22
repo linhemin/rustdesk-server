@@ -93,6 +93,9 @@ pub async fn start_with_bind(
         BLOCKLIST.read().await.len()
     );
     let port: u16 = port.parse()?;
+    if crate::common::direct_only_enabled() {
+        log::info!("DIRECT_ONLY=Y: relay pairing disabled");
+    }
     log::info!("Listening on tcp :{}", port);
     let port2 = port + 2;
     log::info!("Listening on websocket :{}", port2);
@@ -422,6 +425,9 @@ async fn handle_connection(
         return;
     }
     let ip = ip.to_string();
+    if crate::common::direct_only_enabled() {
+        return;
+    }
     let reported = addr.ip().to_string();
     let listed = |list: &HashSet<String>| list.contains(&ip) || list.contains(&reported);
     if listed(&*BLOCKLIST.read().await) {
