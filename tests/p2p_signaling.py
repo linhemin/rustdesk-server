@@ -378,23 +378,25 @@ def test(workspace):
             assert source == endpoint and data[8:20] == query[8:20] and data[32:36] == bytes.fromhex("c0510026")
             return data[36:74]
 
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as a, socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as b, \
-                socket.create_connection(endpoint, 4, controller) as connection:
-            a.bind(controller)
-            b.bind(controlled)
-            a.settimeout(3)
-            b.settimeout(3)
-            left, right = observe_candidate(a), observe_candidate(b)
-            session = SecureConnection(connection, public_key)
-            session.send(8, field(1, peer_id) + field(3, key.read_bytes().strip())
-                         + field(7, a.getsockname()[1]) + field(33, left) + field(40, 1))
-            punch = parse(parse(mediator.recv(2048))[9])
-            assert punch[33] == varint(a.getsockname()[1])
-            response = field(1, punch[1]) + field(2, peer_id) + field(5, version)
-            b.sendto(field(10, response + field(31, punch[31]) + field(33, right)), endpoint)
-            reply = session.read(11)
-            assert reply[9] and not reply.get(4) and reply[33] == varint(b.getsockname()[1])
-            assert reply[34] == hashlib.sha256(punch[31]).digest()
+        # Same public egress must preserve the authenticated UDP answer as well.
+        for origin in (controller, controlled):
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as a, socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as b, \
+                    socket.create_connection(endpoint, 4, origin) as connection:
+                a.bind(origin)
+                b.bind(controlled)
+                a.settimeout(3)
+                b.settimeout(3)
+                left, right = observe_candidate(a), observe_candidate(b)
+                session = SecureConnection(connection, public_key)
+                session.send(8, field(1, peer_id) + field(3, key.read_bytes().strip())
+                             + field(7, a.getsockname()[1]) + field(33, left) + field(40, 1))
+                punch = parse(parse(mediator.recv(2048))[9])
+                assert punch[33] == varint(a.getsockname()[1])
+                response = field(1, punch[1]) + field(2, peer_id) + field(5, version)
+                b.sendto(field(10, response + field(31, punch[31]) + field(33, right)), endpoint)
+                reply = session.read(11)
+                assert reply[9] and not reply.get(4) and reply[33] == varint(b.getsockname()[1])
+                assert reply[34] == hashlib.sha256(punch[31]).digest()
         print("Confirmed strict, NAS-attested supplementary ports and scoped peer probe credential")
 
         # Exercise the Windows symmetric-NAT branch, where the answer rides beside the relay UUID.

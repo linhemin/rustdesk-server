@@ -883,6 +883,7 @@ impl RendezvousServer {
         ph: PunchHoleRequest,
         key: &str,
         ws: bool,
+        verified_udp: bool,
     ) -> ResultType<(RendezvousMessage, Option<SocketAddr>)> {
         let mut ph = ph;
         if direct_only_enabled() && !ph.direct_only {
@@ -972,7 +973,8 @@ impl RendezvousServer {
                 });
                 return Ok((msg_out, Some(peer_addr)));
             }
-            let same_intranet: bool = !ws && !force_relay && ph.webrtc_sdp_offer.is_empty()
+            let same_intranet: bool = !(verified_udp && udp_punch_reply)
+                && !ws && !force_relay && ph.webrtc_sdp_offer.is_empty()
                 && (peer_is_lan && is_lan || try_into_v4(peer_addr).ip() == try_into_v4(addr).ip());
             let socket_addr = AddrMangle::encode(addr).into();
             if same_intranet {
@@ -1095,7 +1097,7 @@ impl RendezvousServer {
                 let candidate_ports = if session_key.is_empty() && self.allows_session_direct() {
                     crate::mapping_observer::verified_ports(&ph.udp_mapping_tickets, addr)
                 } else { Vec::new() };
-                let (mut msg, peer) = self.handle_punch_hole_request(addr, ph, key, false).await?;
+                let (mut msg, peer) = self.handle_punch_hole_request(addr, ph, key, false, !candidate_ports.is_empty()).await?;
                 let Some(peer) = peer else {
                     let _ = sender.try_send(msg);
                     return Ok(true);
@@ -1371,7 +1373,7 @@ impl RendezvousServer {
         key: &str,
         ws: bool,
     ) -> ResultType<()> {
-        let (msg, to_addr) = self.handle_punch_hole_request(addr, ph, key, ws).await?;
+        let (msg, to_addr) = self.handle_punch_hole_request(addr, ph, key, ws, false).await?;
         if let Some(addr) = to_addr {
             self.tx.send(Data::Msg(msg.into(), addr))?;
         } else {
