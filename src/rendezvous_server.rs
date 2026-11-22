@@ -148,6 +148,7 @@ fn max_message_kb(arg: &str) -> usize {
     }
 }
 const SESSION_DIRECT_PROOF_SERIAL: i32 = -604180;
+const IPV4_RENDEZVOUS_SERIAL: i32 = -604181;
 
 // Store punch hole requests
 use once_cell::sync::Lazy;
@@ -1071,6 +1072,26 @@ impl RendezvousServer {
             // This handler is reached only after the rendezvous key exchange. Keep the
             // connection available for RelayResponse after proving possession of its
             // directional key. Ordinary NAT requests retain their one-shot behavior.
+            Some(Union::TestNatRequest(request)) if request.serial == IPV4_RENDEZVOUS_SERIAL => {
+                // Advertise only this hbbs listener, on its authenticated channel.
+                // STUN observers and relay servers can belong to other operators.
+                let mut response = TestNatResponse::new();
+                if self.allows_session_direct() {
+                    if let Some(endpoint) = std::env::var("RUSTDESK_RENDEZVOUS_IPV4").ok()
+                        .and_then(|s| s.parse::<std::net::SocketAddrV4>().ok())
+                        .filter(|a| a.port() != 0 && !a.ip().is_unspecified() && !a.ip().is_multicast() && !a.ip().is_broadcast())
+                    {
+                        response.cu = MessageField::some(ConfigUpdate {
+                            serial: IPV4_RENDEZVOUS_SERIAL,
+                            rendezvous_servers: vec![endpoint.to_string()],
+                            ..Default::default()
+                        });
+                    }
+                }
+                let mut reply = RendezvousMessage::new();
+                reply.set_test_nat_response(response);
+                sender.try_send(reply)?;
+            }
             Some(Union::TestNatRequest(request)) if request.serial == SESSION_DIRECT_PROOF_SERIAL => {
                 let mut reply = RendezvousMessage::new();
                 reply.set_test_nat_response(TestNatResponse {

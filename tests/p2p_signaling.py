@@ -20,6 +20,7 @@ from nacl.bindings import (
 
 # A protobuf int32 below zero is encoded as a sign-extended, 64-bit varint.
 SESSION_DIRECT_PROOF = (1 << 64) - 604180
+IPV4_RENDEZVOUS = (1 << 64) - 604181
 
 
 def varint(value):
@@ -379,6 +380,14 @@ def test(workspace):
             return data[36:74]
 
         # Same public egress must preserve the authenticated UDP answer as well.
+        with socket.create_connection(("::1", endpoint[1]), 4) as connection:
+            ipv6 = SecureConnection(connection, public_key)
+            ipv6.send(20, field(1, IPV4_RENDEZVOUS))
+            config = parse(ipv6.read(21)[2])
+            assert config[1] == IPV4_RENDEZVOUS
+            host, port = config[2].decode().rsplit(":", 1)
+            endpoint = (host, int(port))
+            assert endpoint == ("127.0.0.1", 32216)
         for origin in (controller, controlled):
             with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as a, socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as b, \
                     socket.create_connection(endpoint, 4, origin) as connection:
@@ -441,6 +450,8 @@ def test_restricted_policy(server, workspace, env, port):
             with socket.create_connection(endpoint, 4) as connection:
                 session = SecureConnection(connection, base64.b64decode(key.read_bytes()))
                 assert session.allow_session_direct == 0
+                session.send(20, field(1, IPV4_RENDEZVOUS))
+                assert 2 not in session.read(21)
                 session.send(20, field(1, SESSION_DIRECT_PROOF))
                 assert session.read(21).get(1, 0) == 0
                 session.send(20, b"")
@@ -458,7 +469,8 @@ def main():
         workspace = Path(temp)
         with workspace.joinpath("hbbs.log").open("w+") as log:
             os.environ["TEST_SIGNED_OBSERVER"] = "1"
-            env = dict(os.environ, ALWAYS_USE_RELAY="N", MASK="", RUSTDESK_UDP_MAPPING_OBSERVERS="192.0.2.17:32216")
+            env = dict(os.environ, ALWAYS_USE_RELAY="N", MASK="", RUSTDESK_UDP_MAPPING_OBSERVERS="192.0.2.17:32216",
+                       RUSTDESK_RENDEZVOUS_IPV4="127.0.0.1:32216")
             process = subprocess.Popen([server, "-p", "32216"], cwd=workspace, env=env,
                                        stdout=log, stderr=log)
             relay_process = subprocess.Popen(
