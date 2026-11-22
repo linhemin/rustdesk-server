@@ -29,6 +29,10 @@ use std::{
     sync::Arc,
 };
 
+#[path = "relay_quic.rs"]
+mod relay_quic;
+use relay_quic::QuicRelay;
+
 type Usage = (usize, usize, usize, usize);
 type WaitingPeer = (Arc<()>, Box<dyn StreamTrait>);
 
@@ -96,6 +100,19 @@ pub async fn start_with_bind(
     if crate::common::direct_only_enabled() {
         log::info!("DIRECT_ONLY=Y: relay pairing disabled");
     }
+    let quic = if crate::common::get_arg("RUSTDESK_RELAY_QUIC") == "Y"
+        && !crate::common::direct_only_enabled()
+    {
+        match QuicRelay::listen(bind_addr, port) {
+            Ok(listener) => Some(listener),
+            Err(err) => {
+                log::warn!("QUIC relay unavailable: {err:#}");
+                None
+            }
+        }
+    } else {
+        None
+    };
     log::info!("Listening on tcp :{}", port);
     let port2 = port + 2;
     log::info!("Listening on websocket :{}", port2);
@@ -106,6 +123,7 @@ pub async fn start_with_bind(
                 crate::common::listen_tcp(bind_addr, port).await?,
                 crate::common::listen_tcp(bind_addr, port2).await?,
                 crate::common::listen_console(bind_addr, port).await?,
+                quic.as_ref(),
                 &key,
             )
             .await;
@@ -350,6 +368,7 @@ async fn io_loop(
     listener: TcpListener,
     listener2: TcpListener,
     listener_console: Option<TcpListener>,
+    mut quic: Option<&QuicRelay>,
     key: &str,
 ) {
     check_params();
@@ -378,6 +397,19 @@ async fn io_loop(
                        log::error!("listener2.accept failed: {}", err);
                        break;
                     }
+                }
+            }
+            incoming = async {
+                match quic {
+                    Some(listener) => listener.accept().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                if let (Some(listener), Some(incoming)) = (quic, incoming) {
+                    listener.dispatch(incoming, key, &limiter).await;
+                } else {
+                    log::warn!("QUIC relay listener stopped");
+                    quic = None;
                 }
             }
             res = crate::common::accept_or_pending(listener_console.as_ref()) => {
@@ -424,13 +456,10 @@ async fn handle_connection(
         });
         return;
     }
-    let ip = ip.to_string();
     if crate::common::direct_only_enabled() {
         return;
     }
-    let reported = addr.ip().to_string();
-    let listed = |list: &HashSet<String>| list.contains(&ip) || list.contains(&reported);
-    if listed(&*BLOCKLIST.read().await) {
+    if relay_blocked(addr).await {
         log::info!("{} blocked", ip);
         return;
     }
@@ -439,6 +468,12 @@ async fn handle_connection(
     tokio::spawn(async move {
         allow_err!(make_pair(stream, addr, &key, limiter, ws).await);
     });
+}
+
+async fn relay_blocked(addr: SocketAddr) -> bool {
+    let blocked = BLOCKLIST.read().await;
+    blocked.contains(&addr.ip().to_string())
+        || blocked.contains(&hbb_common::try_into_v4(addr).ip().to_string())
 }
 
 /// Prepares a TCP or WebSocket relay stream and begins pairing.
