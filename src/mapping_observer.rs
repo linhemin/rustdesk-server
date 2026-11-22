@@ -23,7 +23,7 @@ fn minute() -> u32 {
 }
 
 pub(crate) fn verified_ports(tickets: &[u8], from: SocketAddr) -> Vec<u32> {
-    if tickets.is_empty() || tickets.len() > 3 * 38 || tickets.len() % 38 != 0 {
+    if tickets.is_empty() || tickets.len() > 11 * 38 || tickets.len() % 38 != 0 {
         return Vec::new();
     }
     let ip = hbb_common::try_into_v4(from).ip();
@@ -166,6 +166,9 @@ pub(crate) fn binding_reply(data: &[u8], peer: SocketAddr) -> Option<Vec<u8>> {
         reply.extend_from_slice(&ticket);
         reply.extend_from_slice(&tag.0);
         reply.extend_from_slice(&[0, 0]);
+        if &data[32..40] == b"RD-WIDE1" {
+            reply.extend_from_slice(&[0xc0, 0x52, 0, 4, 0, 0, 0, 11]);
+        }
         reply[3] = (reply.len() - 20) as u8;
     }
     Some(reply)
@@ -230,6 +233,27 @@ mod tests {
                 .unwrap()
                 .octets()
         );
+    }
+
+    #[test]
+    fn wide_observation_is_opt_in_and_only_accepts_eleven_verified_ports() {
+        let mut query = [0; 96];
+        query[..8].copy_from_slice(&[0, 1, 0, 76, 0x21, 0x12, 0xa4, 0x42]);
+        query[20..24].copy_from_slice(&[0, 0x26, 0, 72]);
+        query[24..32].copy_from_slice(b"RD-PATH1");
+        let mut source: SocketAddr = "192.0.2.10:45000".parse().unwrap();
+        assert_eq!(binding_reply(&query, source).unwrap().len(), 76);
+        query[32..40].copy_from_slice(b"RD-WIDE1");
+        let mut tickets = Vec::new();
+        for port in 45000..45011 {
+            source.set_port(port);
+            let reply = binding_reply(&query, source).unwrap();
+            assert_eq!(&reply[76..], &[0xc0, 0x52, 0, 4, 0, 0, 0, 11]);
+            tickets.extend_from_slice(&reply[36..74]);
+        }
+        assert_eq!(verified_ports(&tickets, source), (45000..45011).collect::<Vec<u32>>());
+        tickets.extend_from_within(..38);
+        assert!(verified_ports(&tickets, source).is_empty());
     }
 
     #[test]

@@ -1265,6 +1265,8 @@ impl RendezvousServer {
             }
             (route.sender.clone(), sdp, route.direct_only, endpoint)
         };
+        let candidate_ports = crate::mapping_observer::verified_ports(&answer.udp_mapping_tickets, from);
+        let has_candidates = !candidate_ports.is_empty();
         let mut response = PunchHoleResponse {
             socket_addr: AddrMangle::encode(endpoint).into(),
             pk: self.get_pk(&answer.version, answer.id.clone()).await,
@@ -1272,8 +1274,8 @@ impl RendezvousServer {
             socket_addr_v6: if direct_only { answer.socket_addr_v6.clone() } else { Bytes::new() },
             webrtc_sdp_answer: sdp,
             is_udp: true,
-            udp_candidate_ports: crate::mapping_observer::verified_ports(&answer.udp_mapping_tickets, from),
-            udp_probe_key: if matches!(answer.udp_mapping_tickets.len(), 38 | 76 | 114) && answer.webrtc_sdp_answer.is_empty()
+            udp_candidate_ports: candidate_ports,
+            udp_probe_key: if has_candidates && answer.webrtc_sdp_answer.is_empty()
                 && self.allows_session_direct() {
                 Bytes::copy_from_slice(&sodiumoxide::crypto::hash::sha256::hash(&answer.udp_reply_token).0)
             } else { Bytes::new() },
