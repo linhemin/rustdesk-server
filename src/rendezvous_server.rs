@@ -103,6 +103,11 @@ fn apply_direct_policy(mut msg: RendezvousMessage, direct_only: bool) -> Rendezv
     msg
 }
 
+fn same_public_ipv4(a: SocketAddr, b: SocketAddr) -> bool {
+    matches!(try_into_v4(a), SocketAddr::V4(v4) if crate::mapping_observer::SharedEgress::public(*v4.ip())
+        && try_into_v4(b).ip() == std::net::IpAddr::V4(*v4.ip()))
+}
+
 fn valid_v6_candidate(bytes: &[u8]) -> bool {
     if bytes.len() != 18 { return false; }
     let addr = AddrMangle::decode(bytes);
@@ -778,6 +783,7 @@ impl RendezvousServer {
                 old.last_reg_time = Instant::now();
                 old.lan_probe = registration.lan_probe;
                 old.udp_punch_reply = registration.udp_punch_reply;
+                old.udp_endpoint_candidates = registration.udp_endpoint_candidates;
             }
             let ip_change = if ip_change && old.reg_pk.0 <= 2 {
                 Some(if old.socket_addr.port() == 0 {
@@ -906,13 +912,14 @@ impl RendezvousServer {
         // because punch hole won't work if in the same intranet,
         // all routers will drop such self-connections.
         if let Some(peer) = self.pm.get(&id).await {
-            let (elapsed, peer_addr, peer_lan_probe, udp_punch_reply) = {
+            let (elapsed, peer_addr, peer_lan_probe, udp_punch_reply, udp_endpoint_candidates) = {
                 let r = peer.read().await;
                 (
                     r.last_reg_time.elapsed().as_millis() as i64,
                     r.socket_addr,
                     r.lan_probe,
                     r.udp_punch_reply,
+                    r.udp_endpoint_candidates,
                 )
             };
             if elapsed >= REG_TIMEOUT {
@@ -1006,7 +1013,15 @@ impl RendezvousServer {
                     nat_type: ph.nat_type,
                     relay_server,
                     force_relay,
-                    udp_port: if udp_punch_reply && !force_relay && !ws && try_into_v4(addr).is_ipv4()
+                    udp_lan_endpoint: if verified_udp && udp_endpoint_candidates && !force_relay && !ws
+                        && same_public_ipv4(if ph.udp_observed_ipv4 == 0 { addr } else {
+                            SocketAddr::from((std::net::Ipv4Addr::from(ph.udp_observed_ipv4), 0))
+                        }, peer_addr) {
+                        hbb_common::lan_udp::endpoint(&ph.udp_lan_endpoint).map(|a| a.to_string()).unwrap_or_default()
+                    } else { String::new() },
+                    udp_observed_ipv4: if verified_udp && udp_endpoint_candidates { ph.udp_observed_ipv4 } else { 0 },
+                    udp_port: if udp_punch_reply && !force_relay && !ws
+                        && (try_into_v4(addr).is_ipv4() || (verified_udp && udp_endpoint_candidates && ph.udp_observed_ipv4 != 0))
                         && try_into_v4(peer_addr).is_ipv4() && (1..=65535).contains(&ph.udp_port) {
                         ph.udp_port
                     } else { 0 },
@@ -1100,7 +1115,7 @@ impl RendezvousServer {
                 });
                 sender.try_send(reply)?;
             }
-            Some(Union::PunchHoleRequest(ph)) if !ph.webrtc_sdp_offer.is_empty()
+            Some(Union::PunchHoleRequest(mut ph)) if !ph.webrtc_sdp_offer.is_empty()
                 || (!ph.force_relay && (1..=65535).contains(&ph.udp_port)) =>
             {
                 let direct_only = ph.direct_only;
@@ -1116,7 +1131,7 @@ impl RendezvousServer {
                 };
                 let peer_id = ph.id.clone();
                 let candidate_ports = if session_key.is_empty() && self.allows_session_direct() {
-                    crate::mapping_observer::verified_ports(&ph.udp_mapping_tickets, addr)
+                    crate::mapping_observer::offer_ports(&mut ph, addr)
                 } else { Vec::new() };
                 let (mut msg, peer) = self.handle_punch_hole_request(addr, ph, key, false, !candidate_ports.is_empty()).await?;
                 let Some(peer) = peer else {
@@ -1159,6 +1174,7 @@ impl RendezvousServer {
                     }
                     if let Some(route) = routes.get(&token) {
                         route.direct_only = direct_only;
+                        route.lan_udp = !msg.punch_hole().udp_lan_endpoint.is_empty();
                         if msg.punch_hole().udp_port > 0 {
                             let mut reply = [0; 16];
                             sodiumoxide::randombytes::randombytes_into(&mut reply);
@@ -1261,7 +1277,7 @@ impl RendezvousServer {
 
     async fn forward_udp_punch_answer(&mut self, answer: &PunchHoleSent, from: SocketAddr) -> ResultType<bool> {
         let from = try_into_v4(from);
-        let (sender, sdp, direct_only, endpoint) = {
+        let (sender, sdp, direct_only, endpoint, lan_udp) = {
             let mut routes = self.webrtc_routes.lock().await;
             let Some(route) = routes.get(&answer.socket_addr) else {
                 return Ok(!answer.udp_reply_token.is_empty());
@@ -1286,7 +1302,7 @@ impl RendezvousServer {
                     endpoint = wan;
                 }
             }
-            (route.sender.clone(), sdp, route.direct_only, endpoint)
+            (route.sender.clone(), sdp, route.direct_only, endpoint, route.lan_udp)
         };
         let candidate_ports = crate::mapping_observer::verified_ports(&answer.udp_mapping_tickets, from);
         let has_candidates = !candidate_ports.is_empty();
@@ -1297,6 +1313,9 @@ impl RendezvousServer {
             socket_addr_v6: if direct_only { answer.socket_addr_v6.clone() } else { Bytes::new() },
             webrtc_sdp_answer: sdp,
             is_udp: true,
+            udp_lan_endpoint: if lan_udp && has_candidates {
+                hbb_common::lan_udp::endpoint(&answer.udp_lan_endpoint).map(|a| a.to_string()).unwrap_or_default()
+            } else { String::new() },
             udp_candidate_ports: candidate_ports,
             udp_probe_key: if has_candidates && answer.webrtc_sdp_answer.is_empty()
                 && self.allows_session_direct() {

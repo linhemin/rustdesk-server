@@ -40,6 +40,21 @@ pub(crate) fn verified_ports(tickets: &[u8], from: SocketAddr) -> Vec<u32> {
     ports
 }
 
+pub(crate) fn offer_ports(ph: &mut hbb_common::rendezvous_proto::PunchHoleRequest, signaling: SocketAddr) -> Vec<u32> {
+    let claimed = std::net::Ipv4Addr::from(std::mem::take(&mut ph.udp_observed_ipv4));
+    if hbb_common::try_into_v4(signaling).is_ipv6() && SharedEgress::public(claimed) {
+        let ports = verified_ports(&ph.udp_mapping_tickets, SocketAddr::from((claimed, 0)));
+        // Across families only the receipt vouches for a reachable candidate port.
+        if let Some(port) = ports.first() {
+            ph.udp_port = *port as i32;
+            ph.udp_observed_ipv4 = u32::from(claimed);
+        }
+        ports
+    } else {
+        verified_ports(&ph.udp_mapping_tickets, signaling)
+    }
+}
+
 pub(crate) fn configured() -> Vec<String> {
     let mut observers = Vec::new();
     let list = std::env::var("RUSTDESK_UDP_MAPPING_OBSERVERS").unwrap_or_default();
@@ -95,7 +110,7 @@ impl SharedEgress {
             .then_some(Self { inside, outside })
     }
 
-    fn public(ip: std::net::Ipv4Addr) -> bool {
+    pub(crate) fn public(ip: std::net::Ipv4Addr) -> bool {
         let [a, b, _, _] = ip.octets();
         a != 0 && a < 224 && !ip.is_private() && !ip.is_loopback() && !ip.is_link_local()
             && !ip.is_documentation() && !(a == 100 && (64..128).contains(&b))
@@ -270,6 +285,24 @@ mod tests {
         assert!(verified_ports(&ticket, "192.0.2.11:48721".parse().unwrap()).is_empty());
         ticket[1] ^= 1;
         assert!(verified_ports(&ticket, source).is_empty());
+    }
+
+    #[test]
+    fn ipv6_signaling_can_offer_only_the_ipv4_tuple_observed_by_this_server() {
+        let signal = "[2001:db8::9]:55555".parse().unwrap();
+        let ip = std::net::Ipv4Addr::new(11, 23, 0, 11);
+        let mut ticket = 45678u16.to_be_bytes().to_vec();
+        ticket.extend_from_slice(&minute().to_be_bytes());
+        ticket.extend_from_slice(&receipt_tag(ip.into(), &ticket).0);
+        let mut ph = hbb_common::rendezvous_proto::PunchHoleRequest {
+            udp_mapping_tickets: ticket.into(), udp_observed_ipv4: u32::from(ip),
+            udp_port: 12345, ..Default::default()
+        };
+        assert_eq!(offer_ports(&mut ph, signal), [45678]);
+        assert_eq!((ph.udp_observed_ipv4, ph.udp_port), (u32::from(ip), 45678));
+        ph.udp_observed_ipv4 += 1;
+        assert!(offer_ports(&mut ph, signal).is_empty());
+        assert_eq!(ph.udp_observed_ipv4, 0);
     }
 
     #[test]
