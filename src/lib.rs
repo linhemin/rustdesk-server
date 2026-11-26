@@ -3,6 +3,7 @@ mod rendezvous_server;
 pub use rendezvous_server::*;
 pub mod common;
 mod database;
+mod device_stream;
 mod peer;
 mod punch_metrics;
 mod regional_relay;

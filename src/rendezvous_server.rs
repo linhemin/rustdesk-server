@@ -197,6 +197,7 @@ struct Inner {
 
 #[derive(Clone)]
 pub struct RendezvousServer {
+    device_streams: crate::device_stream::Registry,
     tcp_punch: Arc<Mutex<HashMap<SocketAddr, (Sink, bool)>>>,
     webrtc_routes: Arc<Mutex<Routes>>,
     pm: PeerMap,
@@ -256,6 +257,7 @@ impl RendezvousServer {
             tcp_punch: Arc::new(Mutex::new(HashMap::new())),
             webrtc_routes: Arc::new(Mutex::new(Routes::default())),
             pm,
+            device_streams: Default::default(),
             tx: tx.clone(),
             relay_servers: Default::default(),
             relay_servers0: Default::default(),
@@ -584,7 +586,8 @@ impl RendezvousServer {
                         }
                     }
                     if changed {
-                        self.pm.update_pk(id, peer, addr, rk.uuid, rk.pk, ip).await;
+                        self.pm.update_pk(id.clone(), peer, addr, rk.uuid, rk.pk.clone(), ip).await;
+                        self.device_streams.revoke_changed_key(&id, &rk.pk);
                     }
                     let mut msg_out = RendezvousMessage::new();
                     msg_out.set_register_pk_response(RegisterPkResponse {
@@ -1780,6 +1783,14 @@ impl RendezvousServer {
             sink = Some(Sink::Ws(a));
             while let Ok(Some(Ok(msg))) = timeout(30_000, b.next()).await {
                 if let tungstenite::Message::Binary(bytes) = msg {
+                    if let Some(request) = crate::device_stream::hello(&bytes) {
+                        if let (Some(sk), Some(Sink::Ws(tx))) = (self.inner.sk.as_ref(), sink.take()) {
+                            let ws = tx.reunite(b).map_err(|_| hbb_common::anyhow::anyhow!("Device stream unavailable"))?;
+                            return crate::device_stream::serve(crate::device_stream::Wire::Ws(ws), request,
+                                try_into_v4(addr), &self.pm, &self.device_streams, sk).await;
+                        }
+                        return Ok(());
+                    }
                     if !self.handle_tcp(&bytes, &mut sink, addr, key, ws).await {
                         break;
                     }
@@ -1824,6 +1835,15 @@ impl RendezvousServer {
             !direct_only_enabled() && crate::regional_relay::enabled(&self.relay_servers0),
         )
         .await?;
+        if conn.is_secured() {
+            let Some(bytes) = timeout(30_000, conn.next()).await?.transpose()? else { return Ok(()) };
+            if let Some(request) = crate::device_stream::hello(&bytes) {
+                drop(_slot);
+                return crate::device_stream::serve(crate::device_stream::Wire::Tcp(conn), request,
+                    addr, &self.pm, &self.device_streams, sk).await;
+            }
+            first = Some(bytes);
+        }
         let (sender, mut outgoing) = mpsc::channel(96);
         let mut active_route = None;
         let mut sink = Some(Sink::Queued(sender.clone()));
