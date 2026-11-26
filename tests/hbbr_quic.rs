@@ -2,7 +2,7 @@ use hbb_common::{
     bytes::Bytes,
     futures_util::{SinkExt, StreamExt},
     protobuf::Message,
-    rendezvous_proto::{RendezvousMessage, RequestRelay},
+    rendezvous_proto::{RegionalRelayPing, RendezvousMessage, RequestRelay},
     tcp::FramedStream,
     tokio::{
         self, io,
@@ -237,6 +237,18 @@ async fn raw_pair(relay: &Relay, left: &mut FramedStream, right: &mut FramedStre
         .unwrap();
     read_raw(left, &to_left).await;
     read_raw(right, &to_right).await;
+}
+
+#[tokio::test]
+async fn regional_relay_ping_reaches_the_pinned_quic_endpoint() {
+    let relay = Relay::start(false, false).await;
+    let endpoint = relay.endpoint();
+    let mut leg = relay.leg(&endpoint).await;
+    let mut ping = RendezvousMessage::new();
+    ping.set_regional_relay_ping(RegionalRelayPing { nonce: 0xaba0_cafe_1949, ..Default::default() });
+    leg.send(&ping).await.unwrap();
+    let reply = leg.next_timeout(3000).await.unwrap().unwrap();
+    assert_eq!(RendezvousMessage::parse_from_bytes(&reply).unwrap(), ping);
 }
 
 #[tokio::test]

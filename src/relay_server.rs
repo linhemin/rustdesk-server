@@ -517,19 +517,35 @@ async fn make_pair(
             tokio_tungstenite::accept_hdr_async_with_config(stream, callback, Some(ws_config)),
         )
         .await??;
-        make_pair_(ws_stream, addr, key, limiter).await;
+        make_pair_(ws_stream, addr, key, limiter, None).await;
     } else {
-        make_pair_(FramedStream::from(stream, addr), addr, key, limiter).await;
+        make_pair_(FramedStream::from(stream, addr), addr, key, limiter, None).await;
     }
     Ok(())
 }
 
 /// Checks a configured relay key and pairs a request with a waiting connection.
-async fn make_pair_(stream: impl StreamTrait, addr: SocketAddr, key: &str, limiter: Limiter) {
+async fn make_pair_(stream: impl StreamTrait, addr: SocketAddr, key: &str, limiter: Limiter,
+    quic: Option<&quinn::Connection>) {
     let mut stream = stream;
     stream.set_max_packet_length(MAX_RELAY_REQUEST_LEN);
     if let Ok(Some(Ok(bytes))) = timeout(30_000, stream.recv()).await {
         if let Ok(msg_in) = RendezvousMessage::parse_from_bytes(&bytes) {
+            if let Some(rendezvous_message::Union::RegionalRelayPing(ping)) = &msg_in.union {
+                if ping.nonce != 0 {
+                    let mut reply = RendezvousMessage::new();
+                    reply.set_regional_relay_ping(RegionalRelayPing { nonce: ping.nonce, ..Default::default() });
+                    if let Ok(bytes) = reply.write_to_bytes() {
+                        if matches!(timeout(2000, stream.send_raw(bytes.into())).await, Ok(Ok(()))) {
+                            if let Some(connection) = quic {
+                                // Dropping the connection here can discard a queued QUIC reply.
+                                let _ = timeout(2000, connection.closed()).await;
+                            }
+                        }
+                    }
+                }
+                return;
+            }
             if let Some(rendezvous_message::Union::RequestRelay(rf)) = msg_in.union {
                 if !key.is_empty() && rf.licence_key != key {
                     log::warn!("Relay authentication failed from {} - invalid key", addr);

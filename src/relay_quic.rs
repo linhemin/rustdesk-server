@@ -223,7 +223,7 @@ impl QuicRelay {
                 _slot: slot,
             };
             // The next bytes always enter the ordinary relay request parser, including on loopback.
-            super::make_pair_(FramedStream::from(io, addr), addr, &key, limiter).await;
+            super::make_pair_(FramedStream::from(io, addr), addr, &key, limiter, Some(&connection)).await;
         });
     }
 }
