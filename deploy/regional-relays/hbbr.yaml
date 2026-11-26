@@ -1,0 +1,15 @@
+services:
+  hbbr:
+    image: ${RUSTDESK_SERVER_IMAGE:?Set RUSTDESK_SERVER_IMAGE to the image built from this fork}
+    entrypoint: ["hbbr"]
+    command: ["-k", "${RELAY_PUBLIC_KEY:?Set the public key from hbbs-data/id_ed25519.pub}"]
+    working_dir: /root
+    environment:
+      RUSTDESK_RELAY_QUIC: ${RUSTDESK_RELAY_QUIC:-N}
+    volumes:
+      - ./hbbr-data:/root:ro
+    ports:
+      - "21117:21117/tcp"
+      - "21117:21117/udp"
+      - "127.0.0.1:21119:21119/tcp"
+    restart: unless-stopped
