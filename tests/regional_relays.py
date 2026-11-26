@@ -148,6 +148,9 @@ def run(hbbs, hbbr):
                 expect_no_packet(caller)
             from session_relays import exercise
             exercise(endpoint, peer, peer_id, key, ("127.0.0.2", 0), ("127.0.0.3", 0))
+            from session_relays import exercise_node_keys
+            exercise_node_keys(endpoint, peer, peer_id, key, ("127.0.0.2", 0), ("127.0.0.3", 0),
+                               host, hbbr, launch, tls)
     print("Three independent hbbr processes: signed discovery, TCP/WS echo, per-session selection and bidirectional payload passed.")
 
 

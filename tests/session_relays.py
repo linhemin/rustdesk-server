@@ -15,6 +15,107 @@ def listing(names):
     return field(47, b"".join(field(1, name) for name in names))
 
 
+def node_id(endpoint, public, rendezvous_public):
+    if public == rendezvous_public:
+        return endpoint
+    digest = sha256(b"RustDesk relay identity v1\0" + endpoint + b"\0" + public).hexdigest()[:48]
+    return b"k1-" + digest.encode() + b".relay-id.invalid:21117"
+
+
+def exercise_node_keys(hbbs, host, peer_id, operator, caller_bind, host_bind, bind, hbbr, launch, tls):
+    default_pk = base64.b64decode(operator, validate=True)
+    assert node_id(b"relay.example:21117", bytes(range(32)), bytes(32)) == (
+        b"k1-1eaab4e6f29d823f5ac07387f620bfe396f10b5e2b71fe81.relay-id.invalid:21117")
+    host.send(field(6, field(1, peer_id) + field(47, 1)))
+    assert not parse(parse(host.recv(4096))[7]).get(2)
+    local = {}
+    for n, port in enumerate((32478, 32482)):
+        public = bytes(SigningKey.generate().verify_key)
+        address = f"{bind}:{port}".encode()
+        wire = node_id(address, public, default_pk)
+        launch(hbbr, f"independent-{n}", "-b", bind, "-p", str(port), "-k", base64.b64encode(public).decode())
+        deadline = time.monotonic() + 5
+        while True:
+            try:
+                with socket.create_connection((bind, port), .25):
+                    break
+            except ConnectionRefusedError:
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(.03)
+        local[wire] = (address, port, public)
+
+    ids = list(local)
+    assert len(ids) == 2
+    first, second = (local[i] for i in ids)
+    assert node_id(first[0], default_pk, default_pk) == first[0]
+    wrong_key = node_id(first[0], second[2], default_pk)
+    assert wrong_key not in local
+    # Eight entries exceed the UDP budget. Membership of either keyed node survives compaction.
+    long_names = [(b"d" * 60 + b".") * 3 + str(i).encode() + b".test:21117" for i in range(6)]
+    for offer, selected, approved in [(ids, ids[0], True), (long_names + ids, ids[1], True),
+                                      (ids, wrong_key, False), (ids, first[0], False),
+                                      ([first[0]], ids[0], False)]:
+        with socket.create_connection(hbbs, 4, caller_bind) as caller:
+            sample = field(41, field(1, selected) + field(2, 25))
+            send_tcp(caller, field(8, field(1, peer_id) + field(3, operator) + field(6, b"1.5.3") + listing(offer) + sample))
+            punch = parse(parse(host.recv(4096))[9])
+            relays = parse_fields(punch[47])
+            if len(offer) == 8:
+                assert relays[2] == [b"".join(sha256(i).digest()[:16] for i in offer)]
+            else:
+                assert relays[1] == offer
+                assert (parse(punch[41])[1] if 41 in punch else None) == (selected if approved else None)
+            with socket.create_connection(hbbs, 4, host_bind) as reply:
+                send_tcp(reply, field(10, field(1, punch[1]) + field(2, peer_id) + field(3, selected)
+                                      + field(5, b"1.5.3") + listing([selected])))
+            result = read_tcp(caller, 11)
+            if not approved:
+                assert result.get(4, b"") == b"" and result[47] == b""
+                continue
+            assert result[4] == selected and parse_fields(result[47])[1] == [selected]
+            # The identifier never reaches the resolver: the dial and credentials come from
+            # the test peer's own entry, as they must for a client using the 147 wire protocol.
+            _, port, public = local[result[4]]
+            pair_id = uuid.uuid4().hex.encode()
+            with socket.create_connection(hbbs, 4, caller_bind) as requester:
+                send_tcp(requester, field(18, field(1, peer_id) + field(2, pair_id) + field(4, selected) + listing([selected])))
+                pending = parse(parse(host.recv(4096))[18])
+                assert pending[2] == pair_id and pending[4] == selected and parse(pending[47])[1] == selected
+                with socket.create_connection(hbbs, 4, host_bind) as responder:
+                    send_tcp(responder, field(19, field(1, pending[3]) + field(2, pending[2]) + field(3, selected) + listing([selected])))
+                ack = read_tcp(requester, 19)
+                assert ack[2] == pair_id and ack[3] == selected and parse(ack[47])[1] == selected
+            request = field(2, ack[2])
+            for bad in (default_pk, second[2] if public == first[2] else first[2]):
+                with socket.create_connection((bind, port), 4) as wrong:
+                    send_tcp(wrong, field(18, request + field(6, base64.b64encode(bad))))
+                    assert wrong.recv(1) == b""
+            pair = field(18, request + field(6, base64.b64encode(public)))
+            with socket.create_connection((bind, port), 4) as left, socket.create_connection((bind, port), 4) as right:
+                send_tcp(left, pair)
+                send_tcp(right, pair)
+                left.sendall(b"to host")
+                assert read_exact(right, 7) == b"to host"
+                right.sendall(b"to caller")
+                assert read_exact(left, 9) == b"to caller"
+            ws_target = (bind, port + 2)
+            with tls.connect(ws_target, "/ws/relay") as wrong:
+                wrong.send_binary(field(18, request + field(6, operator)))
+                try:
+                    assert not wrong.recv()
+                except websocket.WebSocketConnectionClosedException:
+                    pass
+            with tls.connect(ws_target, "/ws/relay") as left, tls.connect(ws_target, "/ws/relay") as right:
+                left.send_binary(pair)
+                right.send_binary(pair)
+                left.send_binary(b"to host")
+                assert right.recv() == b"to host"
+                right.send_binary(b"to caller")
+                assert left.recv() == b"to caller"
+    print("Unchanged hbbs: endpoint/key agreement, compact wire IDs and two separately keyed hbbr pairs passed.")
+
+
 def exercise(endpoint, host, peer_id, key, caller_bind, host_bind):
     first = b"relay-a.example:21117"
     second = b"relay-b.example:21117"

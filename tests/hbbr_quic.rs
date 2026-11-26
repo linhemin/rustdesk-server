@@ -304,6 +304,27 @@ async fn authenticated_quic_relays_with_quic_websocket_and_legacy_tcp() {
 }
 
 #[tokio::test]
+async fn independent_relays_accept_only_their_own_transport_and_pairing_key() {
+    let first = Relay::start(false, false).await;
+    let second = Relay::start(false, false).await;
+    assert_ne!(first.pin, second.pin);
+    timeout(Duration::from_secs(15), async {
+        for (relay, other) in [(&first, &second), (&second, &first)] {
+            let endpoint = relay.endpoint();
+            assert!(relay.connect(&endpoint, other.pin, ALPN, SNI).await.is_err());
+            let mut wrong = relay.leg(&endpoint).await;
+            wrong.send(&other.request()).await.unwrap();
+            assert!(!matches!(wrong.next().await, Some(Ok(_))));
+            let mut left = relay.leg(&endpoint).await;
+            let mut right = relay.leg(&endpoint).await;
+            raw_pair(relay, &mut left, &mut right).await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
 async fn rejects_wrong_pin_sni_alpn_and_does_not_route_udp_to_the_console() {
     let relay = Relay::start(false, false).await;
     let endpoint = relay.endpoint();
