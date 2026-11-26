@@ -7,6 +7,7 @@ mod device_stream;
 mod peer;
 mod punch_metrics;
 mod regional_relay;
+mod session_relays;
 mod relay_policy;
 mod version;
 mod webrtc_signaling;

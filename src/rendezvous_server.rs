@@ -1,5 +1,6 @@
 use crate::common::*;
 use crate::peer::*;
+use crate::session_relays;
 use crate::webrtc_signaling::{self, Outbound, Routes};
 use hbb_common::{
     allow_err, bail,
@@ -198,7 +199,7 @@ struct Inner {
 #[derive(Clone)]
 pub struct RendezvousServer {
     device_streams: crate::device_stream::Registry,
-    tcp_punch: Arc<Mutex<HashMap<SocketAddr, (Sink, bool)>>>,
+    tcp_punch: Arc<Mutex<HashMap<SocketAddr, (Sink, bool, session_relays::Offer)>>>,
     webrtc_routes: Arc<Mutex<Routes>>,
     pm: PeerMap,
     tx: Sender,
@@ -397,7 +398,11 @@ impl RendezvousServer {
                 }
                 Some(data) = rx.recv() => {
                     match data {
-                        Data::Msg(msg, addr) => { allow_err!(socket.send(msg.as_ref(), addr).await); }
+                        Data::Msg(mut msg, addr) => {
+                            crate::regional_relay::fit_udp_offer(&mut msg);
+                            session_relays::fit_udp_offer(&mut msg);
+                            allow_err!(socket.send(msg.as_ref(), addr).await);
+                        }
                         Data::RelayServers0(rs) => { self.parse_relay_servers(&rs); }
                         Data::RelayServers(rs) => { self.relay_servers = Arc::new(rs); }
                     }
@@ -669,6 +674,10 @@ impl RendezvousServer {
                     return false;
                 }
                 Some(rendezvous_message::Union::PunchHoleRequest(mut ph)) => {
+                    session_relays::bounded(&mut ph.session_relays);
+                    if ph.udp_port != 0 || !ph.webrtc_sdp_offer.is_empty() {
+                        ph.websocket_path_ticket.clear();
+                    }
                     ph.webrtc_sdp_offer.clear();
                     ph.udp_port = 0;
                     // there maybe several attempt, so sink can be none
@@ -676,8 +685,9 @@ impl RendezvousServer {
                         let mut pending = self.tcp_punch.lock().await;
                         let source = try_into_v4(addr);
                         if let Some(sink) = sink.take() {
-                            pending.insert(source, (sink, ph.direct_only));
-                        } else if let Some((_, direct_only)) = pending.get_mut(&source) {
+                            pending.insert(source, (sink, ph.direct_only, ph.session_relays.clone()));
+                        } else if let Some((_, direct_only, offered)) = pending.get_mut(&source) {
+                            if offered != &ph.session_relays { return false; }
                             if *direct_only && !ph.direct_only {
                                 drop(pending);
                                 allow_err!(self.send_to_tcp_sync(punch_failure(DIRECT_REQUIRED), addr).await);
@@ -690,8 +700,9 @@ impl RendezvousServer {
                     return true;
                 }
                 Some(rendezvous_message::Union::RequestRelay(mut rf)) => {
+                    session_relays::bounded(&mut rf.session_relays);
                     if direct_only_enabled() || (sink.is_none() && self.tcp_punch.lock().await
-                        .get(&try_into_v4(addr)).is_some_and(|(_, direct)| *direct))
+                        .get(&try_into_v4(addr)).is_some_and(|(_, direct, offered)| *direct || offered != &rf.session_relays))
                     {
                         if sink.is_some() {
                             Self::send_to_sink(sink, relay_refusal(DIRECT_REQUIRED)).await;
@@ -709,14 +720,31 @@ impl RendezvousServer {
                     }
                     // there maybe several attempt, so sink can be none
                     if let Some(sink) = sink.take() {
-                        self.tcp_punch.lock().await.insert(try_into_v4(addr), (sink, false));
+                        self.tcp_punch.lock().await.insert(try_into_v4(addr), (sink, false, rf.session_relays.clone()));
+                    }
+                    if rf.session_relays.as_ref().is_some_and(|offer| offer.servers.is_empty()
+                        || (!rf.relay_server.is_empty() && !offer.servers.contains(&rf.relay_server))) {
+                        allow_err!(self.send_to_tcp_sync(relay_refusal(session_relays::UNAVAILABLE), addr).await);
+                        return false;
                     }
                     if let Some(peer) = self.pm.get_in_memory(&rf.id).await {
                         let mut msg_out = RendezvousMessage::new();
+                        let peer = peer.read().await;
+                        let stream = self.device_streams.get(&rf.id, &peer.pk);
+                        let peer_addr = peer.socket_addr;
+                        let supports = stream.as_ref().map_or(peer.supports_session_relays, |s| s.supports_session_relays);
+                        drop(peer);
+                        if rf.session_relays.is_some() && !supports {
+                            allow_err!(self.send_to_tcp_sync(relay_refusal(session_relays::UNAVAILABLE), addr).await);
+                            return false;
+                        }
                         rf.socket_addr = AddrMangle::encode(addr).into();
                         msg_out.set_request_relay(rf);
-                        let peer_addr = peer.read().await.socket_addr;
-                        self.tx.send(Data::Msg(msg_out.into(), peer_addr)).ok();
+                        if let Some(stream) = stream.and_then(|link| link.tx) {
+                            let _ = stream.try_send(msg_out);
+                        } else {
+                            self.tx.send(Data::Msg(msg_out.into(), peer_addr)).ok();
+                        }
                     }
                     return true;
                 }
@@ -800,6 +828,7 @@ impl RendezvousServer {
                 old.lan_probe = registration.lan_probe;
                 old.udp_punch_reply = registration.udp_punch_reply;
                 old.udp_endpoint_candidates = registration.udp_endpoint_candidates;
+                old.supports_session_relays = registration.supports_session_relays;
             }
             let ip_change = if ip_change && old.reg_pk.0 <= 2 {
                 Some(if old.socket_addr.port() == 0 {
@@ -843,6 +872,8 @@ impl RendezvousServer {
         let mut msg_out = RendezvousMessage::new();
         let mut p = PunchHoleResponse {
             socket_addr: AddrMangle::encode(addr).into(),
+            websocket_path: socket.is_none() && phs.websocket_path,
+            session_relays: phs.session_relays,
             pk: self.get_pk(&phs.version, phs.id).await,
             relay_server: phs.relay_server.clone(),
             ..Default::default()
@@ -885,6 +916,7 @@ impl RendezvousServer {
         let mut p = PunchHoleResponse {
             socket_addr: la.local_addr.clone(),
             lan_probe: la.lan_probe,
+            session_relays: la.session_relays,
             pk: self.get_pk(&la.version, la.id).await,
             relay_server: la.relay_server,
             ..Default::default()
@@ -907,8 +939,9 @@ impl RendezvousServer {
         key: &str,
         ws: bool,
         verified_udp: bool,
-    ) -> ResultType<(RendezvousMessage, Option<SocketAddr>)> {
+    ) -> ResultType<(RendezvousMessage, Option<crate::device_stream::Downlink>)> {
         let mut ph = ph;
+        session_relays::bounded(&mut ph.session_relays);
         if direct_only_enabled() && !ph.direct_only {
             return Ok((punch_failure(DIRECT_REQUIRED), None));
         }
@@ -928,16 +961,25 @@ impl RendezvousServer {
         // because punch hole won't work if in the same intranet,
         // all routers will drop such self-connections.
         if let Some(peer) = self.pm.get(&id).await {
-            let (elapsed, peer_addr, peer_lan_probe, udp_punch_reply, udp_endpoint_candidates) = {
+            let (elapsed, downlink, peer_lan_probe, udp_punch_reply, udp_endpoint_candidates) = {
                 let r = peer.read().await;
+                let registered = self.device_streams.get(&id, &r.pk);
+                let via_stream = registered.is_some();
                 (
-                    r.last_reg_time.elapsed().as_millis() as i64,
-                    r.socket_addr,
-                    r.lan_probe,
-                    r.udp_punch_reply,
-                    r.udp_endpoint_candidates,
+                    if via_stream { 0 } else { r.last_reg_time.elapsed().as_millis() as i64 },
+                    registered.unwrap_or(crate::device_stream::Downlink { addr: r.socket_addr, tx: None, supports_session_relays: r.supports_session_relays }),
+                    r.lan_probe && !via_stream,
+                    r.udp_punch_reply && !via_stream,
+                    r.udp_endpoint_candidates && !via_stream,
                 )
             };
+            let peer_addr = downlink.addr;
+            if let Some(offer) = ph.session_relays.as_mut() {
+                if !downlink.supports_session_relays {
+                    offer.servers.clear();
+                    ph.direct_only = true;
+                }
+            }
             if elapsed >= REG_TIMEOUT {
                 let mut msg_out = RendezvousMessage::new();
                 msg_out.set_punch_hole_response(PunchHoleResponse {
@@ -957,23 +999,32 @@ impl RendezvousServer {
 
             let mut msg_out = RendezvousMessage::new();
             let peer_is_lan = self.is_lan(peer_addr);
-            let socket_addr_v6 = if ph.direct_only && valid_v6_candidate(&ph.socket_addr_v6) {
+            let socket_addr_v6 = if (ph.direct_only && valid_v6_candidate(&ph.socket_addr_v6))
+                || self.explicit_v6(&ph.session_relays, &ph.socket_addr_v6) {
                 ph.socket_addr_v6
             } else {
                 Bytes::new()
             };
             let is_lan = self.is_lan(addr);
-            let mut relay_server = if ph.direct_only { String::new() } else {
-                self.get_relay_server(addr.ip(), peer_addr.ip())
+            let relay_samples = if ph.direct_only || peer_is_lan || is_lan {
+                Vec::new()
+            } else if let Some(list) = ph.session_relays.as_ref() {
+                session_relays::samples(list, &ph.relay_samples)
+            } else {
+                crate::regional_relay::ranked(&self.relay_servers0, &self.relay_servers, &ph.relay_samples)
+            };
+            let mut relay_server = if ph.direct_only || ph.session_relays.is_some() { String::new() } else {
+                relay_samples.first().map(|s| s.relay_server.clone())
+                    .unwrap_or_else(|| self.get_relay_server(addr.ip(), peer_addr.ip()))
             };
             let force_relay = ph.force_relay
                 || ALWAYS_USE_RELAY.load(Ordering::SeqCst)
                 || (peer_is_lan ^ is_lan);
             if force_relay {
-                if ph.direct_only {
+                if ph.direct_only || ph.session_relays.as_ref().is_some_and(|s| s.servers.is_empty()) {
                     return Ok((punch_failure("Direct connection unavailable under relay policy"), None));
                 }
-                if peer_is_lan {
+                if peer_is_lan && ph.session_relays.is_none() {
                     // https://github.com/rustdesk/rustdesk-server/issues/24
                     relay_server = self.inner.local_ip.clone()
                 }
@@ -991,11 +1042,13 @@ impl RendezvousServer {
                     socket_addr: AddrMangle::encode(addr).into(),
                     relay_server,
                     lan_probe: true,
+                    relay_samples,
+                    session_relays: ph.session_relays,
                     direct_only: ph.direct_only,
                     socket_addr_v6,
                     ..Default::default()
                 });
-                return Ok((msg_out, Some(peer_addr)));
+                return Ok((msg_out, Some(downlink)));
             }
             let same_intranet: bool = !(verified_udp && udp_punch_reply)
                 && !ws && !force_relay && ph.webrtc_sdp_offer.is_empty()
@@ -1011,6 +1064,8 @@ impl RendezvousServer {
                 msg_out.set_fetch_local_addr(FetchLocalAddr {
                     socket_addr,
                     relay_server,
+                    relay_samples,
+                    session_relays: ph.session_relays,
                     direct_only: ph.direct_only,
                     socket_addr_v6,
                     ..Default::default()
@@ -1024,6 +1079,18 @@ impl RendezvousServer {
                 );
                 msg_out.set_punch_hole(PunchHole {
                     socket_addr,
+                    prefer_relay_start: ph.prefer_relay_start && self.allows_session_direct()
+                        && !ph.direct_only && (!force_relay || (ws && ph.allow_relay_ice)) && !peer_is_lan && !is_lan
+                        && ph.session_relays.as_ref().map_or(!relay_server.is_empty() || self.relay_servers0.is_empty(), |offer| !offer.servers.is_empty())
+                        && try_into_v4(addr).ip() != try_into_v4(peer_addr).ip(),
+                    allow_relay_ice: ws && ph.allow_relay_ice && !ph.direct_only && self.allows_session_direct()
+                        && !direct_only_enabled(),
+                    websocket_path_ticket: if ph.direct_only && ph.udp_port == 0 && ph.webrtc_sdp_offer.is_empty()
+                        && ph.websocket_path_ticket.len() == 32 {
+                        ph.websocket_path_ticket
+                    } else { Bytes::new() },
+                    relay_samples,
+                    session_relays: ph.session_relays,
                     direct_only: ph.direct_only,
                     socket_addr_v6,
                     nat_type: ph.nat_type,
@@ -1045,7 +1112,7 @@ impl RendezvousServer {
                     ..Default::default()
                 });
             }
-            Ok((msg_out, Some(peer_addr)))
+            Ok((msg_out, Some(downlink)))
         } else {
             let mut msg_out = RendezvousMessage::new();
             msg_out.set_punch_hole_response(PunchHoleResponse {
@@ -1065,11 +1132,12 @@ impl RendezvousServer {
         let mut states = BytesMut::zeroed((peers.len() + 7) / 8);
         for (i, peer_id) in peers.iter().enumerate() {
             if let Some(peer) = self.pm.get_in_memory(peer_id).await {
-                let elapsed = peer.read().await.last_reg_time.elapsed().as_millis() as i64;
+                let peer = peer.read().await;
+                let elapsed = peer.last_reg_time.elapsed().as_millis() as i64;
                 // bytes index from left to right
                 let states_idx = i / 8;
                 let bit_idx = 7 - i % 8;
-                if elapsed < REG_TIMEOUT {
+                if elapsed < REG_TIMEOUT || self.device_streams.get(peer_id, &peer.pk).is_some() {
                     states[states_idx] |= 0x01 << bit_idx;
                 }
             }
@@ -1156,10 +1224,12 @@ impl RendezvousServer {
                     crate::mapping_observer::offer_ports(&mut ph, addr)
                 } else { Vec::new() };
                 let (mut msg, peer) = self.handle_punch_hole_request(addr, ph, key, false, !candidate_ports.is_empty()).await?;
-                let Some(peer) = peer else {
+                let Some(downlink) = peer else {
                     let _ = sender.try_send(msg);
                     return Ok(true);
                 };
+                let peer = downlink.addr;
+                let direct_only = msg.punch_hole().direct_only;
                 if !msg.has_punch_hole()
                     || (msg.punch_hole().webrtc_sdp_offer.is_empty() && msg.punch_hole().udp_port == 0)
                 {
@@ -1177,25 +1247,40 @@ impl RendezvousServer {
                         return Ok(true);
                     };
                     if route.peer_id != peer_id || route.peer != peer || route.session_key != session_key
-                        || route.direct_only != direct_only
+                        || route.direct_only != direct_only || route.session_relays != msg.punch_hole().session_relays
                         || !route.retry_offer()
                     {
                         return Ok(true);
                     }
                     msg.mut_punch_hole().socket_addr = token.clone();
+                    if msg.punch_hole().prefer_relay_start {
+                        let offer = msg.mut_punch_hole();
+                        offer.prefer_relay_start = route.relay_start_token.is_some();
+                        if let Some(reply) = &route.relay_start_token {
+                            offer.relay_start_token = Bytes::copy_from_slice(reply);
+                        }
+                    }
                     if let Some(reply) = route.udp_reply_token.as_ref() {
                         msg.mut_punch_hole().udp_reply_token = Bytes::copy_from_slice(reply);
                     } else {
                         msg.mut_punch_hole().udp_port = 0;
                     }
-                    self.tx.send(Data::Msg(msg.into(), peer))?;
+                    self.deliver_peer(msg, peer, route.downlink.as_ref())?;
                 } else {
                     let token = msg.punch_hole().socket_addr.clone();
                     if !routes.start(token.clone(), addr, peer, peer_id, session_key, sender.clone()) {
                         return Ok(false);
                     }
                     if let Some(route) = routes.get(&token) {
+                        route.downlink = downlink.tx.clone();
+                        route.session_relays = msg.punch_hole().session_relays.clone();
                         route.direct_only = direct_only;
+                        if msg.punch_hole().prefer_relay_start {
+                            let mut reply = [0; 16];
+                            sodiumoxide::randombytes::randombytes_into(&mut reply);
+                            route.relay_start_token = Some(reply);
+                            msg.mut_punch_hole().relay_start_token = Bytes::copy_from_slice(&reply);
+                        }
                         route.lan_udp = !msg.punch_hole().udp_lan_endpoint.is_empty();
                         if msg.punch_hole().udp_port > 0 {
                             let mut reply = [0; 16];
@@ -1206,7 +1291,7 @@ impl RendezvousServer {
                     }
                     *active_route = Some(token);
                     log::debug!("WebRTC offer forwarded to registered peer at {}", peer.ip());
-                    self.tx.send(Data::Msg(msg.into(), peer))?;
+                    self.deliver_peer(msg, peer, downlink.tx.as_ref())?;
                 }
             }
             Some(Union::IceCandidate(mut ice)) => {
@@ -1219,7 +1304,7 @@ impl RendezvousServer {
                             ice.id.clear();
                             let mut msg = RendezvousMessage::new();
                             msg.set_ice_candidate(ice);
-                            self.tx.send(Data::Msg(msg.into(), route.peer))?;
+                            self.deliver_peer(msg, route.peer, route.downlink.as_ref())?;
                         }
                     }
                 } else if let Some(route) = routes.get(&ice.socket_addr) {
@@ -1244,7 +1329,7 @@ impl RendezvousServer {
                 }
             }
             Some(Union::PunchHoleSent(phs)) if !phs.webrtc_sdp_answer.is_empty() => {
-                if let Some((_, sender, direct_only)) = self.webrtc_answer_route(
+                if let Some((_, sender, direct_only, offered)) = self.webrtc_answer_route(
                     &phs.socket_addr, addr, &phs.id, &phs.webrtc_sdp_answer,
                 ).await {
                     let pk = self.get_pk(&phs.version, phs.id).await;
@@ -1254,7 +1339,8 @@ impl RendezvousServer {
                             socket_addr: AddrMangle::encode(addr).into(),
                             pk,
                             relay_server: phs.relay_server,
-                            socket_addr_v6: if direct_only { phs.socket_addr_v6 } else { Bytes::new() },
+                            session_relays: phs.session_relays,
+                            socket_addr_v6: if direct_only || self.explicit_v6(&offered, &phs.socket_addr_v6) { phs.socket_addr_v6 } else { Bytes::new() },
                             webrtc_sdp_answer: phs.webrtc_sdp_answer,
                             ..Default::default()
                         };
@@ -1262,7 +1348,7 @@ impl RendezvousServer {
                             response.set_nat_type(nat);
                         }
                         msg.set_punch_hole_response(response);
-                        let _ = sender.try_send(apply_direct_policy(msg, direct_only));
+                        let _ = sender.try_send(apply_direct_policy(session_relays::response(msg, &offered), direct_only));
                         log::debug!("WebRTC answer forwarded");
                     }
                 }
@@ -1271,15 +1357,30 @@ impl RendezvousServer {
                 let route = if rr.webrtc_sdp_answer.is_empty() {
                     let mut routes = self.webrtc_routes.lock().await;
                     let Some(route) = routes.get(&rr.socket_addr) else { return Ok(false) };
-                    ((route.session_key.is_empty() || (route.direct_only && valid_v6_candidate(&rr.socket_addr_v6)))
-                        && route.accepts_answer(addr, rr.id()))
-                        .then(|| (route.controller, route.sender.clone(), route.direct_only))
+                    if !route.accepts_answer(addr, rr.id()) {
+                        return Ok(true);
+                    }
+                    let accept = if rr.prefer_relay_start {
+                        if !route.direct_only && !rr.relay_server.is_empty() && validate_relay_uuid(&rr.uuid).is_ok()
+                            && route.relay_start_token.as_ref().is_some_and(|token|
+                                sodiumoxide::utils::memcmp(token, &rr.relay_start_token)) {
+                            route.relay_start_token = None;
+                            rr.relay_start_token.clear();
+                            true
+                        } else { false }
+                    } else {
+                        route.session_key.is_empty() || (route.direct_only && valid_v6_candidate(&rr.socket_addr_v6))
+                            || self.explicit_v6(&route.session_relays, &rr.socket_addr_v6)
+                            || (route.session_relays.is_some() && rr.session_relays.is_some()
+                                && !rr.refuse_reason.is_empty() && rr.uuid.is_empty() && rr.relay_server.is_empty())
+                    };
+                    accept.then(|| (route.controller, route.sender.clone(), route.direct_only, route.session_relays.clone()))
                 } else {
                     self.webrtc_answer_route(
                         &rr.socket_addr, addr, rr.id(), &rr.webrtc_sdp_answer,
                     ).await
                 };
-                if let Some((controller, sender, direct_only)) = route {
+                if let Some((controller, sender, direct_only, offered)) = route {
                     let pk = self.get_pk(&rr.version, rr.id().to_owned()).await;
                     if !pk.is_empty() {
                         rr.set_pk(pk);
@@ -1287,7 +1388,7 @@ impl RendezvousServer {
                         self.adjust_relay_server(&mut rr, addr, controller);
                         let mut msg = RendezvousMessage::new();
                         msg.set_relay_response(rr);
-                        let _ = sender.try_send(apply_direct_policy(msg, direct_only));
+                        let _ = sender.try_send(apply_direct_policy(session_relays::response(msg, &offered), direct_only));
                         log::debug!("WebRTC answer and relay fallback forwarded");
                     }
                 }
@@ -1299,7 +1400,7 @@ impl RendezvousServer {
 
     async fn forward_udp_punch_answer(&mut self, answer: &PunchHoleSent, from: SocketAddr) -> ResultType<bool> {
         let from = try_into_v4(from);
-        let (sender, sdp, direct_only, endpoint, lan_udp) = {
+        let (sender, sdp, direct_only, endpoint, lan_udp, offered) = {
             let mut routes = self.webrtc_routes.lock().await;
             let Some(route) = routes.get(&answer.socket_addr) else {
                 return Ok(!answer.udp_reply_token.is_empty());
@@ -1324,7 +1425,7 @@ impl RendezvousServer {
                     endpoint = wan;
                 }
             }
-            (route.sender.clone(), sdp, route.direct_only, endpoint, route.lan_udp)
+            (route.sender.clone(), sdp, route.direct_only, endpoint, route.lan_udp, route.session_relays.clone())
         };
         let candidate_ports = crate::mapping_observer::verified_ports(&answer.udp_mapping_tickets, from);
         let has_candidates = !candidate_ports.is_empty();
@@ -1332,7 +1433,8 @@ impl RendezvousServer {
             socket_addr: AddrMangle::encode(endpoint).into(),
             pk: self.get_pk(&answer.version, answer.id.clone()).await,
             relay_server: answer.relay_server.clone(),
-            socket_addr_v6: if direct_only { answer.socket_addr_v6.clone() } else { Bytes::new() },
+            session_relays: answer.session_relays.clone(),
+            socket_addr_v6: if direct_only || self.explicit_v6(&offered, &answer.socket_addr_v6) { answer.socket_addr_v6.clone() } else { Bytes::new() },
             webrtc_sdp_answer: sdp,
             is_udp: true,
             udp_lan_endpoint: if lan_udp && has_candidates {
@@ -1350,7 +1452,7 @@ impl RendezvousServer {
         }
         let mut msg = RendezvousMessage::new();
         msg.set_punch_hole_response(response);
-        let _ = sender.try_send(apply_direct_policy(msg, direct_only));
+        let _ = sender.try_send(apply_direct_policy(session_relays::response(msg, &offered), direct_only));
         Ok(true)
     }
 
@@ -1360,19 +1462,24 @@ impl RendezvousServer {
         from: SocketAddr,
         peer_id: &str,
         answer: &str,
-    ) -> Option<(SocketAddr, Outbound, bool)> {
+    ) -> Option<(SocketAddr, Outbound, bool, session_relays::Offer)> {
         let target = {
             let mut routes = self.webrtc_routes.lock().await;
             let route = routes.get(token)?;
             route.accepts_answer(from, peer_id)
-                .then(|| (route.controller, route.sender.clone(), route.direct_only))?
+                .then(|| (route.controller, route.sender.clone(), route.direct_only, route.session_relays.clone()))?
         };
         webrtc_signaling::description_key(answer, "answer", target.2)?;
         Some(target)
     }
 
+    fn explicit_v6(&self, offer: &session_relays::Offer, bytes: &[u8]) -> bool {
+        offer.is_some() && self.allows_session_direct() && valid_v6_candidate(bytes)
+            && matches!(AddrMangle::decode(bytes).ip(), std::net::IpAddr::V6(ip) if ip.segments()[0] & 0xe000 == 0x2000)
+    }
+
     fn adjust_relay_server(&self, rr: &mut RelayResponse, from: SocketAddr, to: SocketAddr) {
-        if !rr.relay_server.is_empty() {
+        if rr.session_relays.is_none() && !rr.relay_server.is_empty() {
             if self.is_lan(to) {
                 rr.relay_server = self.inner.local_ip.clone();
             } else if rr.relay_server == self.inner.local_ip {
@@ -1383,12 +1490,12 @@ impl RendezvousServer {
 
     #[inline]
     async fn send_to_tcp(&mut self, mut msg: RendezvousMessage, addr: SocketAddr, ipv6: Bytes) {
-        if let Some((sink, direct_only)) = self.tcp_punch.lock().await.remove(&try_into_v4(addr)) {
-            if direct_only && valid_v6_candidate(&ipv6) {
+        if let Some((sink, direct_only, offered)) = self.tcp_punch.lock().await.remove(&try_into_v4(addr)) {
+            if (direct_only && valid_v6_candidate(&ipv6)) || self.explicit_v6(&offered, &ipv6) {
                 msg.mut_punch_hole_response().socket_addr_v6 = ipv6;
             }
             tokio::spawn(async move {
-                Self::send_to_sink(&mut Some(sink), apply_direct_policy(msg, direct_only)).await;
+                Self::send_to_sink(&mut Some(sink), apply_direct_policy(session_relays::response(msg, &offered), direct_only)).await;
             });
         }
     }
@@ -1421,8 +1528,8 @@ impl RendezvousServer {
         addr: SocketAddr,
     ) -> ResultType<()> {
         let route = self.tcp_punch.lock().await.remove(&try_into_v4(addr));
-        if let Some((sink, direct_only)) = route {
-            Self::send_to_sink(&mut Some(sink), apply_direct_policy(msg, direct_only)).await;
+        if let Some((sink, direct_only, offered)) = route {
+            Self::send_to_sink(&mut Some(sink), apply_direct_policy(session_relays::response(msg, &offered), direct_only)).await;
         }
         Ok(())
     }
@@ -1436,11 +1543,17 @@ impl RendezvousServer {
         ws: bool,
     ) -> ResultType<()> {
         let (msg, to_addr) = self.handle_punch_hole_request(addr, ph, key, ws, false).await?;
-        if let Some(addr) = to_addr {
-            self.tx.send(Data::Msg(msg.into(), addr))?;
+        if let Some(peer) = to_addr {
+            self.deliver_peer(msg, peer.addr, peer.tx.as_ref())?;
         } else {
             self.send_to_tcp_sync(msg, addr).await?;
         }
+        Ok(())
+    }
+
+    fn deliver_peer(&self, msg: RendezvousMessage, addr: SocketAddr, stream: Option<&Outbound>) -> ResultType<()> {
+        if let Some(stream) = stream { stream.try_send(msg)?; }
+        else { self.tx.send(Data::Msg(msg.into(), addr))?; }
         Ok(())
     }
 
