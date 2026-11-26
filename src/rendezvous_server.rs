@@ -652,6 +652,19 @@ impl RendezvousServer {
     ) -> bool {
         if let Ok(msg_in) = RendezvousMessage::parse_from_bytes(bytes) {
             match msg_in.union {
+                Some(rendezvous_message::Union::RegionalRelayDirectory(query)) if ws => {
+                    if query.nonce != 0 && query.relay_servers.is_empty() && query.signature.is_empty()
+                        && matches!(sink, Some(Sink::Ws(_))) {
+                        if let Some(sk) = self.inner.sk.as_ref() {
+                            if let Ok(directory) = crate::regional_relay::sign_directory(self.regional_directory(), query.nonce, sk) {
+                                let mut reply = RendezvousMessage::new();
+                                reply.set_regional_relay_directory(directory);
+                                Self::send_to_sink(sink, reply).await;
+                            }
+                        }
+                    }
+                    return false;
+                }
                 Some(rendezvous_message::Union::PunchHoleRequest(mut ph)) => {
                     ph.webrtc_sdp_offer.clear();
                     ph.udp_port = 0;
@@ -1080,6 +1093,12 @@ impl RendezvousServer {
         use rendezvous_message::Union;
 
         match RendezvousMessage::parse_from_bytes(bytes)?.union {
+            Some(Union::RegionalRelayDirectory(query)) if query.relay_servers.is_empty()
+                && query.signature.is_empty() && query.nonce == 0 => {
+                let mut reply = RendezvousMessage::new();
+                reply.set_regional_relay_directory(self.regional_directory());
+                sender.try_send(reply)?;
+            }
             Some(Union::P2pFeedback(report)) => {
                 self.inner.punch_metrics.report(report);
                 return Ok(false);
@@ -1458,6 +1477,16 @@ impl RendezvousServer {
         self.relay_servers = self.relay_servers0.clone();
     }
 
+    fn regional_directory(&self) -> RegionalRelayDirectory {
+        let mut directory = if !direct_only_enabled() && crate::regional_relay::enabled(&self.relay_servers0) {
+            crate::regional_relay::directory(&self.relay_servers0, &self.relay_servers)
+        } else {
+            RegionalRelayDirectory::new()
+        };
+        directory.allow_session_direct = self.allows_session_direct();
+        directory
+    }
+
     fn get_relay_server(&self, pa: IpAddr, pb: IpAddr) -> String {
         if self.relay_servers.is_empty() {
             return "".to_owned();
@@ -1792,6 +1821,7 @@ impl RendezvousServer {
             sk,
             self.allows_session_direct(),
             self.inner.punch_metrics.enabled(),
+            !direct_only_enabled() && crate::regional_relay::enabled(&self.relay_servers0),
         )
         .await?;
         let (sender, mut outgoing) = mpsc::channel(96);
